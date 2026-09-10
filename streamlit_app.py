@@ -1,151 +1,3824 @@
+###############################################################################
+#  法人向け量子ポートフォリオ最適化 + リバースストレステスト
+#  Corporate Risk Management – Quantum Annealing Edition
+#  Powered by Fixstars Amplify AE + IPOPT
+#  ★ Trader Dashboard / RST Scenario Discovery /量子必要性判定 追加
+###############################################################################
 import streamlit as st
+import numpy as np
 import pandas as pd
-import math
-from pathlib import Path
+import plotly.graph_objects as go
+import plotly.express as px
+from datetime import datetime, timedelta
+import warnings, time, math
+warnings.simplefilter("ignore")
 
-# Set the title and favicon that appear in the Browser's tab bar.
+from amplify import VariableGenerator, Model, FixstarsClient, solve, equal_to
+from amplify import sum as asum
+from scipy.optimize import minimize   # 追加
+
+# ══════════════════════════════════════════════════════════════════════════════
+# ページ設定
+# ══════════════════════════════════════════════════════════════════════════════
 st.set_page_config(
-    page_title='GDP dashboard',
-    page_icon=':earth_americas:', # This is an emoji shortcode. Could be a URL too.
+    page_title="量子ポートフォリオ | RST Trader",
+    page_icon="📡",
+    layout="wide",
+    initial_sidebar_state="expanded",
 )
 
-# -----------------------------------------------------------------------------
-# Declare some useful functions.
-
-@st.cache_data
-def get_gdp_data():
-    """Grab GDP data from a CSV file.
-
-    This uses caching to avoid having to read the file every time. If we were
-    reading from an HTTP endpoint instead of a file, it's a good idea to set
-    a maximum age to the cache with the TTL argument: @st.cache_data(ttl='1d')
-    """
-
-    # Instead of a CSV on disk, you could read from an HTTP endpoint here too.
-    DATA_FILENAME = Path(__file__).parent/'data/gdp_data.csv'
-    raw_gdp_df = pd.read_csv(DATA_FILENAME)
-
-    MIN_YEAR = 1960
-    MAX_YEAR = 2022
-
-    # The data above has columns like:
-    # - Country Name
-    # - Country Code
-    # - [Stuff I don't care about]
-    # - GDP for 1960
-    # - GDP for 1961
-    # - GDP for 1962
-    # - ...
-    # - GDP for 2022
-    #
-    # ...but I want this instead:
-    # - Country Name
-    # - Country Code
-    # - Year
-    # - GDP
-    #
-    # So let's pivot all those year-columns into two: Year and GDP
-    gdp_df = raw_gdp_df.melt(
-        ['Country Code'],
-        [str(x) for x in range(MIN_YEAR, MAX_YEAR + 1)],
-        'Year',
-        'GDP',
-    )
-
-    # Convert years from string to integers
-    gdp_df['Year'] = pd.to_numeric(gdp_df['Year'])
-
-    return gdp_df
-
-gdp_df = get_gdp_data()
-
-# -----------------------------------------------------------------------------
-# Draw the actual page
-
-# Set the title that appears at the top of the page.
-'''
-# :earth_americas: GDP dashboard
-
-Browse GDP data from the [World Bank Open Data](https://data.worldbank.org/) website. As you'll
-notice, the data only goes to 2022 right now, and datapoints for certain years are often missing.
-But it's otherwise a great (and did I mention _free_?) source of data.
-'''
-
-# Add some spacing
-''
-''
-
-min_value = gdp_df['Year'].min()
-max_value = gdp_df['Year'].max()
-
-from_year, to_year = st.slider(
-    'Which years are you interested in?',
-    min_value=min_value,
-    max_value=max_value,
-    value=[min_value, max_value])
-
-countries = gdp_df['Country Code'].unique()
-
-if not len(countries):
-    st.warning("Select at least one country")
-
-selected_countries = st.multiselect(
-    'Which countries would you like to view?',
-    countries,
-    ['DEU', 'FRA', 'GBR', 'BRA', 'MEX', 'JPN'])
-
-''
-''
-''
-
-# Filter the data
-filtered_gdp_df = gdp_df[
-    (gdp_df['Country Code'].isin(selected_countries))
-    & (gdp_df['Year'] <= to_year)
-    & (from_year <= gdp_df['Year'])
+SECTORS = [
+    "情報技術", "金融", "ヘルスケア", "消費財", "資本財",
+    "エネルギー", "素材", "通信", "公益事業", "不動産",
 ]
 
-st.header('GDP over time', divider='gray')
+# ══════════════════════════════════════════════════════════════════════════════
+# RST用マーケットファクター定義（量子優位性 完全版: 108ファクター）
+# 7^108 ≈ 10^91 通り → 古典全列挙は宇宙の年齢でも不可能 → 量子アニーリングが必須
+# ファクター体系: 株式(20) + SABR/ボラ(16) + FX/Vanna-Volga(20) + 金利期間構造(18)
+#                + クレジット(12) + コモディティ(12) + 流動性・マクロ(10) = 108
+# ══════════════════════════════════════════════════════════════════════════════
+RST_FACTORS = [
+    # ════════════════════════════════════════════════════════
+    # 【A】株式系ファクター（20因子）
+    # ════════════════════════════════════════════════════════
+    # A1: 主要インデックス デルタ（Δ）
+    {"name": "TOPIX変化率",              "unit": "%",   "levels": [-15,-10,-7,-4,-2, 0, 2],  "color": "#ef4444", "category": "株式Δ",    "group": "A"},
+    {"name": "日経225変化率",             "unit": "%",   "levels": [-18,-12,-8,-4,-2, 0, 3],  "color": "#f87171", "category": "株式Δ",    "group": "A"},
+    {"name": "TOPIX小型株変化率",         "unit": "%",   "levels": [-22,-14,-8,-4,-2, 0, 4],  "color": "#fca5a5", "category": "株式Δ",    "group": "A"},
+    {"name": "S&P500連動変化率",          "unit": "%",   "levels": [-15,-10,-6,-3,-1, 0, 2],  "color": "#fb923c", "category": "株式Δ",    "group": "A"},
+    {"name": "MSCI Asia ex-Japan変化率",  "unit": "%",   "levels": [-18,-12,-7,-3,-1, 0, 3],  "color": "#fbbf24", "category": "株式Δ",    "group": "A"},
+    {"name": "EuroSTOXX50変化率",         "unit": "%",   "levels": [-15,-10,-6,-3,-1, 0, 2],  "color": "#f59e0b", "category": "株式Δ",    "group": "A"},
+    {"name": "中国株(CSI300)変化率",       "unit": "%",   "levels": [-20,-13,-7,-3,-1, 0, 3],  "color": "#d97706", "category": "株式Δ",    "group": "A"},
+    # A2: ガンマ（Γ）- 非線形リスク
+    {"name": "TOPIX急落加速[ガンマ]",     "unit": "%²",  "levels": [-5,-3,-1, 0, 1, 2, 4],   "color": "#dc2626", "category": "株式Γ",    "group": "A"},
+    {"name": "日経オプションガンマ",       "unit": "%²",  "levels": [-4,-2,-1, 0, 1, 2, 3],   "color": "#b91c1c", "category": "株式Γ",    "group": "A"},
+    # A3: スタイルファクター
+    {"name": "バリュー/グロース スプレッド","unit":"idx",  "levels": [-4,-2,-1, 0, 1, 2, 4],   "color": "#c084fc", "category": "スタイル",  "group": "A"},
+    {"name": "モメンタムファクター",       "unit": "idx", "levels": [-3,-2,-1, 0, 1, 2, 3],   "color": "#a855f7", "category": "スタイル",  "group": "A"},
+    {"name": "サイズファクター(小-大型)",  "unit": "idx", "levels": [-3,-2,-1, 0, 1, 2, 3],   "color": "#9333ea", "category": "スタイル",  "group": "A"},
+    {"name": "クオリティファクター",       "unit": "idx", "levels": [-2,-1, 0, 0, 0, 1, 2],   "color": "#7e22ce", "category": "スタイル",  "group": "A"},
+    {"name": "ローボラファクター",         "unit": "idx", "levels": [-2,-1, 0, 0, 1, 2, 3],   "color": "#6b21a8", "category": "スタイル",  "group": "A"},
+    # A4: セクターローテーション
+    {"name": "セクター[情報技術]相対騰落", "unit": "%",   "levels": [-8,-5,-2, 0, 2, 5, 8],   "color": "#0ea5e9", "category": "セクターΔ", "group": "A"},
+    {"name": "セクター[金融]相対騰落",     "unit": "%",   "levels": [-6,-4,-2, 0, 2, 4, 6],   "color": "#0284c7", "category": "セクターΔ", "group": "A"},
+    {"name": "セクター[不動産]相対騰落",   "unit": "%",   "levels": [-8,-5,-2, 0, 2, 5, 8],   "color": "#0369a1", "category": "セクターΔ", "group": "A"},
+    {"name": "セクター[エネルギー]相対騰落","unit": "%",   "levels": [-6,-4,-2, 0, 2, 4, 6],   "color": "#075985", "category": "セクターΔ", "group": "A"},
+    {"name": "高配当株スプレッド変化",     "unit": "bps", "levels": [-30,-20,-10, 0,10,20,30], "color": "#155e75", "category": "セクターΔ", "group": "A"},
+    {"name": "クロスΓ[株式×FX]",          "unit": "idx", "levels": [-3,-2,-1, 0, 1, 2, 3],   "color": "#ec4899", "category": "クロスΓ",  "group": "A"},
 
-''
+    # ════════════════════════════════════════════════════════
+    # 【B】ボラティリティ系 SABR モデルファクター（16因子）
+    # SABR: dF = σ·F^β·dW,  dσ = ν·σ·dZ,  <dW,dZ> = ρ·dt
+    # ════════════════════════════════════════════════════════
+    # B1: VIX/VVIX 系
+    {"name": "VIX水準変化",               "unit": "pts", "levels": [-10,-5,-2, 0, 5,15,30],  "color": "#8b5cf6", "category": "VIX系",    "group": "B"},
+    {"name": "VIX期間構造(VIX3M-VIX)変化","unit": "pts", "levels": [-5,-3,-1, 0, 1, 3, 6],   "color": "#7c3aed", "category": "VIX系",    "group": "B"},
+    {"name": "VVIX(ボラのボラ)変化",       "unit": "pts", "levels": [-15,-8,-3, 0, 3, 8,15],  "color": "#6d28d9", "category": "VIX系",    "group": "B"},
+    # B2: 日本株オプション IV 期間構造
+    {"name": "日本株IV ATM 1M変化",        "unit": "pts", "levels": [-8,-4,-1, 0, 4,12,25],   "color": "#4f46e5", "category": "VolSurf",  "group": "B"},
+    {"name": "日本株IV ATM 3M変化",        "unit": "pts", "levels": [-6,-3,-1, 0, 3, 9,18],   "color": "#4338ca", "category": "VolSurf",  "group": "B"},
+    {"name": "日本株IV ATM 6M変化",        "unit": "pts", "levels": [-5,-3,-1, 0, 2, 7,14],   "color": "#3730a3", "category": "VolSurf",  "group": "B"},
+    {"name": "日本株IV ATM 1Y変化",        "unit": "pts", "levels": [-4,-2,-1, 0, 2, 5,10],   "color": "#312e81", "category": "VolSurf",  "group": "B"},
+    # B3: SABRモデルパラメータ（株式オプション）
+    {"name": "SABR α(ボラ水準)変化",       "unit": "idx", "levels": [-4,-2,-1, 0, 1, 2, 4],   "color": "#c026d3", "category": "SABR",     "group": "B"},
+    {"name": "SABR β(ボラ弾性)変化",       "unit": "idx", "levels": [-2,-1, 0, 0, 0, 1, 2],   "color": "#a21caf", "category": "SABR",     "group": "B"},
+    {"name": "SABR ρ(ボラ-原資産相関)変化","unit": "idx", "levels": [-3,-2,-1, 0, 1, 2, 3],   "color": "#86198f", "category": "SABR",     "group": "B"},
+    {"name": "SABR ν(ボラのボラ)変化",     "unit": "idx", "levels": [-3,-2,-1, 0, 1, 2, 3],   "color": "#701a75", "category": "SABR",     "group": "B"},
+    # B4: ボラサーフェス形状
+    {"name": "ボラスキュー(25ΔPut側)変化", "unit": "pts", "levels": [-5,-3,-1, 0, 1, 3, 6],   "color": "#be123c", "category": "VolSkew",  "group": "B"},
+    {"name": "ボラスキュー(25ΔCall側)変化","unit": "pts", "levels": [-3,-2,-1, 0, 1, 2, 4],   "color": "#9f1239", "category": "VolSkew",  "group": "B"},
+    {"name": "ボラカートシス変化",          "unit": "idx", "levels": [-2,-1, 0, 0, 0, 1, 2],   "color": "#881337", "category": "VolSkew",  "group": "B"},
+    {"name": "ディスパーション(Idx-個別株)","unit": "pts", "levels": [-4,-2,-1, 0, 1, 2, 4],   "color": "#4d7c0f", "category": "VolSkew",  "group": "B"},
+    {"name": "フォワードスタートボラ変化",  "unit": "pts", "levels": [-4,-2,-1, 0, 1, 2, 4],   "color": "#3f6212", "category": "VolSkew",  "group": "B"},
 
-st.line_chart(
-    filtered_gdp_df,
-    x='Year',
-    y='GDP',
-    color='Country Code',
+    # ════════════════════════════════════════════════════════
+    # 【C】FX系 Vanna-Volga モデルファクター（20因子）
+    # Vanna: ∂²V/∂S∂σ  Volga: ∂²V/∂σ²
+    # VV価格 ≈ BS + x₁·Vanna·(σ_RR) + x₂·Volga·(σ_BF)
+    # ════════════════════════════════════════════════════════
+    # C1: FX デルタ 主要通貨ペア
+    {"name": "USD/JPY変化率",             "unit": "%",   "levels": [-8,-5,-3,-1, 0, 3, 6],   "color": "#f97316", "category": "FXΔ",      "group": "C"},
+    {"name": "EUR/JPY変化率",             "unit": "%",   "levels": [-6,-4,-2,-1, 0, 2, 5],   "color": "#fb923c", "category": "FXΔ",      "group": "C"},
+    {"name": "GBP/JPY変化率",             "unit": "%",   "levels": [-7,-4,-2,-1, 0, 2, 5],   "color": "#fdba74", "category": "FXΔ",      "group": "C"},
+    {"name": "AUD/JPY変化率",             "unit": "%",   "levels": [-8,-5,-3,-1, 0, 2, 5],   "color": "#fed7aa", "category": "FXΔ",      "group": "C"},
+    {"name": "CNH/JPY変化率",             "unit": "%",   "levels": [-5,-3,-2,-1, 0, 2, 4],   "color": "#ffedd5", "category": "FXΔ",      "group": "C"},
+    {"name": "EUR/USD変化率",             "unit": "%",   "levels": [-5,-3,-2,-1, 0, 2, 4],   "color": "#fef3c7", "category": "FXΔ",      "group": "C"},
+    {"name": "新興国通貨指数変化率",       "unit": "%",   "levels": [-8,-5,-3,-1, 0, 2, 4],   "color": "#fde68a", "category": "FXΔ",      "group": "C"},
+    # C2: FX ATM IV 期間構造
+    {"name": "USD/JPY ATM IV 1M変化",     "unit": "pts", "levels": [-4,-2,-1, 0, 1, 3, 6],   "color": "#fcd34d", "category": "FX VolSurf","group": "C"},
+    {"name": "USD/JPY ATM IV 3M変化",     "unit": "pts", "levels": [-3,-2,-1, 0, 1, 2, 5],   "color": "#fbbf24", "category": "FX VolSurf","group": "C"},
+    # C3: Vanna-Volga パラメータ（リスクリバーサル・バタフライ）
+    {"name": "USD/JPY 25ΔRR 1M変化[VV]",  "unit": "pts", "levels": [-3,-2,-1, 0, 1, 2, 3],   "color": "#f59e0b", "category": "VannaVolga","group": "C"},
+    {"name": "USD/JPY 25ΔBF 1M変化[VV]",  "unit": "pts", "levels": [-2,-1, 0, 0, 0, 1, 2],   "color": "#d97706", "category": "VannaVolga","group": "C"},
+    {"name": "USD/JPY 25ΔRR 3M変化[VV]",  "unit": "pts", "levels": [-3,-2,-1, 0, 1, 2, 3],   "color": "#b45309", "category": "VannaVolga","group": "C"},
+    {"name": "USD/JPY 25ΔBF 3M変化[VV]",  "unit": "pts", "levels": [-2,-1, 0, 0, 0, 1, 2],   "color": "#92400e", "category": "VannaVolga","group": "C"},
+    {"name": "EUR/JPY 25ΔRR変化[VV]",     "unit": "pts", "levels": [-3,-2,-1, 0, 1, 2, 3],   "color": "#78350f", "category": "VannaVolga","group": "C"},
+    {"name": "EUR/JPY 25ΔBF変化[VV]",     "unit": "pts", "levels": [-2,-1, 0, 0, 0, 1, 2],   "color": "#451a03", "category": "VannaVolga","group": "C"},
+    # C4: Vanna / Volga 感応度
+    {"name": "FX Vanna(∂²V/∂S∂σ)変化",   "unit": "idx", "levels": [-3,-2,-1, 0, 1, 2, 3],   "color": "#14b8a6", "category": "VannaVolga","group": "C"},
+    {"name": "FX Volga(∂²V/∂σ²)変化",    "unit": "idx", "levels": [-3,-2,-1, 0, 1, 2, 3],   "color": "#0d9488", "category": "VannaVolga","group": "C"},
+    {"name": "FX相関(USD/JPY-EUR/JPY)",   "unit": "idx", "levels": [-3,-2,-1, 0, 1, 2, 3],   "color": "#0f766e", "category": "FX相関",   "group": "C"},
+    {"name": "クロスΓ[USD/JPY×株式]",     "unit": "idx", "levels": [-3,-2,-1, 0, 1, 2, 3],   "color": "#ec4899", "category": "クロスΓ",  "group": "C"},
+
+    # ════════════════════════════════════════════════════════
+    # 【D】金利・イールドカーブ期間構造ファクター（18因子）
+    # ════════════════════════════════════════════════════════
+    # D1: JGB スポット金利（テナー別）
+    {"name": "1M JGB金利変化",             "unit": "bps", "levels": [-20,-10,-5, 0, 5,15,30],  "color": "#eab308", "category": "金利期間構造","group": "D"},
+    {"name": "3M JGB金利変化",             "unit": "bps", "levels": [-20,-10,-5, 0, 5,15,30],  "color": "#ca8a04", "category": "金利期間構造","group": "D"},
+    {"name": "6M JGB金利変化",             "unit": "bps", "levels": [-25,-15,-5, 0, 5,20,40],  "color": "#a16207", "category": "金利期間構造","group": "D"},
+    {"name": "1Y JGB金利変化",             "unit": "bps", "levels": [-30,-20,-10, 0,10,25,50],  "color": "#854d0e", "category": "金利期間構造","group": "D"},
+    {"name": "2Y JGB金利変化",             "unit": "bps", "levels": [-30,-20,-10, 0,10,25,50],  "color": "#713f12", "category": "金利期間構造","group": "D"},
+    {"name": "5Y JGB金利変化",             "unit": "bps", "levels": [-40,-25,-10, 0,10,30,60],  "color": "#78350f", "category": "金利期間構造","group": "D"},
+    {"name": "10Y JGB金利変化",            "unit": "bps", "levels": [-50,-30,-10, 0,10,30,60],  "color": "#451a03", "category": "金利期間構造","group": "D"},
+    {"name": "20Y JGB金利変化",            "unit": "bps", "levels": [-60,-35,-10, 0,10,35,70],  "color": "#1c1917", "category": "金利期間構造","group": "D"},
+    {"name": "30Y JGB金利変化",            "unit": "bps", "levels": [-60,-35,-10, 0,10,35,70],  "color": "#0c0a09", "category": "金利期間構造","group": "D"},
+    # D2: カーブ形状
+    {"name": "YCスティープ(2Y-10Y)変化",   "unit": "bps", "levels": [-30,-20,-10, 0,10,20,40],  "color": "#16a34a", "category": "カーブ形状","group": "D"},
+    {"name": "YCスティープ(10Y-30Y)変化",  "unit": "bps", "levels": [-25,-15,-8, 0, 8,15,30],   "color": "#15803d", "category": "カーブ形状","group": "D"},
+    {"name": "YCバタフライ(2-5-10Y)変化",  "unit": "bps", "levels": [-15,-8,-3, 0, 3, 8,15],    "color": "#166534", "category": "カーブ形状","group": "D"},
+    # D3: 金利ボラティリティ（スワップション）
+    {"name": "スワップション1Y1Y IV変化",   "unit": "bps", "levels": [-8,-4,-2, 0, 2, 5,10],    "color": "#14532d", "category": "金利ボラ", "group": "D"},
+    {"name": "スワップション5Y5Y IV変化",   "unit": "bps", "levels": [-6,-3,-1, 0, 1, 3, 7],    "color": "#052e16", "category": "金利ボラ", "group": "D"},
+    # D4: スプレッド・マクロ金利
+    {"name": "TONAR-OISスプレッド変化",    "unit": "bps", "levels": [-10,-5,-2, 0, 2, 5,10],   "color": "#365314", "category": "金利スプレッド","group": "D"},
+    {"name": "日米金利差(10Y)変化",        "unit": "bps", "levels": [-40,-25,-10, 0,10,25,50],  "color": "#3f6212", "category": "金利スプレッド","group": "D"},
+    {"name": "実質金利変化(10Y)",          "unit": "bps", "levels": [-40,-25,-10, 0,10,25,50],  "color": "#4d7c0f", "category": "金利スプレッド","group": "D"},
+    {"name": "クロスΓ[株式×金利]",         "unit": "idx", "levels": [-3,-2,-1, 0, 1, 2, 3],   "color": "#db2777", "category": "クロスΓ",  "group": "D"},
+
+    # ════════════════════════════════════════════════════════
+    # 【E】クレジット系ファクター（12因子）
+    # ════════════════════════════════════════════════════════
+    # E1: 日本クレジット
+    {"name": "日本IG CDS 5Y変化",          "unit": "bps", "levels": [-20,-10,-5, 0, 5,20,50],   "color": "#06b6d4", "category": "クレジット","group": "E"},
+    {"name": "日本HY CDS 5Y変化",          "unit": "bps", "levels": [-50,-25,-10, 0,15,50,120],  "color": "#0891b2", "category": "クレジット","group": "E"},
+    # E2: グローバルクレジット
+    {"name": "米国IG CDX変化",             "unit": "bps", "levels": [-20,-10,-5, 0, 5,20,50],   "color": "#0e7490", "category": "クレジット","group": "E"},
+    {"name": "米国HY CDX変化",             "unit": "bps", "levels": [-60,-30,-10, 0,20,60,120],  "color": "#155e75", "category": "クレジット","group": "E"},
+    {"name": "欧州iTraxx Main変化",        "unit": "bps", "levels": [-20,-10,-5, 0, 5,20,50],   "color": "#164e63", "category": "クレジット","group": "E"},
+    # E3: セクター別クレジット
+    {"name": "金融セクターCDS変化",        "unit": "bps", "levels": [-30,-15,-5, 0, 5,25,60],   "color": "#083344", "category": "クレジット","group": "E"},
+    {"name": "不動産セクターCDS変化",       "unit": "bps", "levels": [-40,-20,-8, 0, 8,30,80],   "color": "#0c4a6e", "category": "クレジット","group": "E"},
+    # E4: クレジット構造
+    {"name": "シニア-サブSP変化",          "unit": "bps", "levels": [-30,-15,-5, 0, 5,20,50],   "color": "#1e3a5f", "category": "クレジット","group": "E"},
+    {"name": "デフォルト相関変化",         "unit": "idx", "levels": [-2,-1, 0, 0, 0, 1, 2],    "color": "#172554", "category": "クレジット","group": "E"},
+    {"name": "リカバリーレート変化",        "unit": "idx", "levels": [-3,-2,-1, 0, 1, 2, 3],    "color": "#1e1b4b", "category": "クレジット","group": "E"},
+    {"name": "BBB格フォーリングエンジェル","unit": "idx", "levels": [-1, 0, 0, 0, 0, 1, 2],    "color": "#312e81", "category": "クレジット","group": "E"},
+    {"name": "クレジットΓ(スプレッド加速)","unit": "idx", "levels": [-3,-2,-1, 0, 1, 2, 3],    "color": "#4338ca", "category": "クロスΓ",  "group": "E"},
+
+    # ════════════════════════════════════════════════════════
+    # 【F】コモディティ系ファクター（12因子）
+    # ════════════════════════════════════════════════════════
+    # F1: エネルギー（期間構造含む）
+    {"name": "原油(WTI 1M)変化率",         "unit": "%",   "levels": [-20,-12,-5, 0, 5,12,20],  "color": "#84cc16", "category": "エネルギー","group": "F"},
+    {"name": "原油(WTI 12M)変化率",        "unit": "%",   "levels": [-15,-8,-3, 0, 3, 8,15],   "color": "#65a30d", "category": "エネルギー","group": "F"},
+    {"name": "原油期間構造(12M-1M)変化",   "unit": "%",   "levels": [-5,-3,-1, 0, 1, 3, 5],    "color": "#4d7c0f", "category": "エネルギー","group": "F"},
+    {"name": "天然ガス価格変化率",          "unit": "%",   "levels": [-25,-15,-5, 0, 5,15,30],  "color": "#3f6212", "category": "エネルギー","group": "F"},
+    # F2: 貴金属
+    {"name": "金価格変化率",               "unit": "%",   "levels": [-8,-4,-2, 0, 2, 5,10],    "color": "#d4a017", "category": "貴金属",   "group": "F"},
+    {"name": "銀価格変化率",               "unit": "%",   "levels": [-12,-7,-3, 0, 3, 7,12],   "color": "#a8a9ad", "category": "貴金属",   "group": "F"},
+    # F3: 産業金属
+    {"name": "銅価格変化率",               "unit": "%",   "levels": [-15,-9,-4, 0, 4, 9,15],   "color": "#b87333", "category": "産業金属", "group": "F"},
+    {"name": "鉄鉱石価格変化率",           "unit": "%",   "levels": [-20,-12,-5, 0, 5,12,20],  "color": "#8b4513", "category": "産業金属", "group": "F"},
+    # F4: 農産物・コモディティボラ
+    {"name": "農産物指数変化率",            "unit": "%",   "levels": [-10,-6,-2, 0, 2, 6,10],   "color": "#56a832", "category": "農産物",   "group": "F"},
+    {"name": "コモディティOVX変化",         "unit": "pts", "levels": [-10,-5,-2, 0, 2, 5,10],   "color": "#3d7a23", "category": "コモボラ", "group": "F"},
+    {"name": "コモディティ相関ショック",    "unit": "idx", "levels": [-2,-1, 0, 0, 0, 1, 2],    "color": "#2d5a17", "category": "コモボラ", "group": "F"},
+    {"name": "クロスΓ[原油×FX]",           "unit": "idx", "levels": [-2,-1, 0, 0, 1, 2, 3],    "color": "#ec4899", "category": "クロスΓ",  "group": "F"},
+
+    # ════════════════════════════════════════════════════════
+    # 【G】流動性・マクロ系ファクター（10因子）
+    # ════════════════════════════════════════════════════════
+    {"name": "市場流動性指数変化(Amihud)", "unit": "idx", "levels": [-3,-2,-1, 0, 1, 2, 4],    "color": "#64748b", "category": "流動性",   "group": "G"},
+    {"name": "株式ビッドアスクSP変化",     "unit": "bps", "levels": [-5,-3,-1, 0, 1, 3, 6],    "color": "#475569", "category": "流動性",   "group": "G"},
+    {"name": "社債市場流動性変化",         "unit": "idx", "levels": [-3,-2,-1, 0, 1, 2, 3],    "color": "#94a3b8", "category": "流動性",   "group": "G"},
+    {"name": "日銀BSサイズ変化",           "unit": "%",   "levels": [-5,-3,-1, 0, 1, 3, 5],    "color": "#1e293b", "category": "マクロ",   "group": "G"},
+    {"name": "実質GDP成長率変化",          "unit": "%",   "levels": [-4,-2,-1, 0, 1, 2, 3],    "color": "#0f172a", "category": "マクロ",   "group": "G"},
+    {"name": "CPIインフレ率変化",          "unit": "%",   "levels": [-1, 0, 0, 0, 1, 2, 4],    "color": "#020617", "category": "マクロ",   "group": "G"},
+    {"name": "製造業PMI変化",              "unit": "idx", "levels": [-8,-5,-2, 0, 2, 5, 8],    "color": "#1a1a2e", "category": "マクロ",   "group": "G"},
+    {"name": "Put/Call比変化(センチメント)","unit": "idx", "levels": [-3,-2,-1, 0, 1, 2, 3],    "color": "#16213e", "category": "センチ",  "group": "G"},
+    {"name": "システミックリスク指数変化",  "unit": "idx", "levels": [-2,-1, 0, 0, 1, 2, 4],    "color": "#0f3460", "category": "センチ",  "group": "G"},
+    {"name": "クロスΓ[流動性×株式]",       "unit": "idx", "levels": [-3,-2,-1, 0, 1, 2, 4],    "color": "#ec4899", "category": "クロスΓ",  "group": "G"},
+]
+N_RST_FACTORS = len(RST_FACTORS)   # 108
+N_RST_LEVELS  = 7
+# 7^108 ≈ 10^91通り → 宇宙の原子数(10^80)を超える探索空間 → 量子アニーリングが絶対必須
+
+# ファクター名→インデックス の高速ルックアップ
+_FACTOR_IDX = {f["name"]: i for i, f in enumerate(RST_FACTORS)}
+
+def _fi(name: str) -> int:
+    """ファクター名からインデックスを返す。存在しなければ -1"""
+    return _FACTOR_IDX.get(name, -1)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# 経済シナリオテンプレート（dict形式 signs・ヘッジ戦略付き完全版）
+# signs: {ファクター名 → 方向 (+1/-1/0)}  ※記載ないファクターは0
+# ══════════════════════════════════════════════════════════════════════════════
+SCENARIO_LIBRARY = {
+    "日本株急落・円安同時進行": {
+        "signs": {
+            "TOPIX変化率": -1, "日経225変化率": -1, "TOPIX小型株変化率": -1,
+            "TOPIX急落加速[ガンマ]": +1, "VIX水準変化": +1, "日本株IV ATM 1M変化": +1,
+            "SABR α(ボラ水準)変化": +1, "SABR ρ(ボラ-原資産相関)変化": -1,
+            "ボラスキュー(25ΔPut側)変化": +1,
+            "USD/JPY変化率": +1, "EUR/JPY変化率": +1,
+            "USD/JPY 25ΔRR 1M変化[VV]": -1,
+            "2Y JGB金利変化": +1, "10Y JGB金利変化": +1,
+            "YCスティープ(2Y-10Y)変化": +1,
+            "日本IG CDS 5Y変化": +1, "日本HY CDS 5Y変化": +1,
+            "金融セクターCDS変化": +1, "不動産セクターCDS変化": +1,
+            "クロスΓ[株式×FX]": +1, "クロスΓ[株式×金利]": +1,
+            "市場流動性指数変化(Amihud)": +1,
+        },
+        "color": "#ef4444",
+        "desc": "TOPIXの急落と円安が同時発生。金利上昇・ボラ急騰・クレジットスプレッド拡大を伴う。"
+                "SABRのρ（ボラ-原資産相関）がマイナス方向に振れ、左歪みが強まる。"
+                "Vanna-Volga効果でリスクリバーサルが急スティープ化し、Put側の暗示IVが急騰する。",
+        "delta_impact":  "▶ 株式Δ：TOPIX▲10〜15%・日経225▲12%・小型株▲15%超\n▶ FXΔ：USD/JPY+5〜8%（輸出企業収益+）、EUR/JPY+3〜5%",
+        "gamma_impact":  "▶ 株式Γ：急落速度が高く非線形損失が増幅。凸性リスクが直撃\n▶ SABR ν上昇：ボラのボラ急騰でガンマコスト爆増\n▶ クロスΓ[株式×FX]：株安と円安の同時進行で分散効果が消滅",
+        "vega_impact":   "▶ VIX+15〜20pts：ショートガンマポジションが急激に損失\n▶ SABR α上昇・ρ低下：左歪みが強化されPut側IVが更に急騰\n▶ VV効果：25ΔRR急拡大で円プット保護コストが跳ね上がる",
+        "credit_impact": "▶ IG/HYスプレッド拡大：外債建て負債比率の高いセクターで資金調達コスト急上昇\n▶ 金融・不動産CDS：含み損拡大と信用収縮が同時進行",
+        "regulatory":    "▶ Basel III FRTB：SABR/VVパラメータ変化でIMA資本要求が増加\n▶ ストレスVaR：サリバント期間として記録の可能性\n▶ IRRBB：金利感応度評価でEVEへの影響が顕在化",
+        "contagion":     "日銀政策転換懸念 → 外国人売り → TOPIX急落 → クレジット収縮 → 銀行含み損拡大 → 更なる売り（負フィードバック）",
+        "hedge": {
+            "優先度1【デルタヘッジ】":   "TOPIX先物ショート（ベータ×ポート時価÷先物理論価格口数）\n日経225プット購入（ATM、1〜3ヶ月物）",
+            "優先度2【ガンマ/ベガヘッジ】": "TOPIX ATMプット購入でガンマロングに転換\nVIX先物ロング（VVIX急騰局面の追加コストに注意）\nSABRガンマスキャルピング：델타中立維持",
+            "優先度3【FXヘッジ】":       "USD/JPY先物ショート（円高ヘッジ）またはプット購入\nVanna-Volatility hedge：25ΔRR拡大に対しリスリバポジション調整",
+            "優先度4【クレジットヘッジ】": "CDSプロテクション購入（金融・不動産セクター集中部分）\nHY-IG スプレッドヘッジのクレジットカーブ取引",
+            "コスト試算":               "デルタヘッジ：AUMの0.1〜0.2%/月\nガンマヘッジ：プレミアム0.5〜1.5%/オプション満期\nFXヘッジ：スワップポイント±0.05%/日",
+            "注意事項":                 "⚠ 円安局面での輸出株Pnlとのオフセット効果を考慮\n⚠ SABRパラメータ変化でヘッジ比率は動的に調整が必要",
+        },
+        "prob": "中（日銀政策転換・地政学リスク時）",
+        "hist": "2022年後半の円安＋日本株調整、2013年バーナンキ・ショック類似局面",
+        "trader_note": "金融・不動産ロングは即日ヘッジ検討。輸出株のショートカバーに注意。",
+    },
+    "グローバルリスクオフ": {
+        "signs": {
+            "TOPIX変化率": -1, "日経225変化率": -1, "TOPIX小型株変化率": -1,
+            "S&P500連動変化率": -1, "EuroSTOXX50変化率": -1,
+            "TOPIX急落加速[ガンマ]": +1, "日経オプションガンマ": +1,
+            "VIX水準変化": +1, "VVIX(ボラのボラ)変化": +1,
+            "日本株IV ATM 1M変化": +1, "日本株IV ATM 3M変化": +1,
+            "SABR α(ボラ水準)変化": +1, "SABR ρ(ボラ-原資産相関)変化": -1,
+            "SABR ν(ボラのボラ)変化": +1,
+            "ボラスキュー(25ΔPut側)変化": +1, "ボラカートシス変化": +1,
+            "USD/JPY変化率": -1, "EUR/JPY変化率": -1, "AUD/JPY変化率": -1,
+            "USD/JPY ATM IV 1M変化": +1, "USD/JPY 25ΔRR 1M変化[VV]": -1,
+            "FX Vanna(∂²V/∂S∂σ)変化": +1,
+            "1M JGB金利変化": -1, "2Y JGB金利変化": -1,
+            "10Y JGB金利変化": -1, "YCスティープ(2Y-10Y)変化": -1,
+            "日本IG CDS 5Y変化": +1, "日本HY CDS 5Y変化": +1,
+            "米国HY CDX変化": +1, "欧州iTraxx Main変化": +1,
+            "金融セクターCDS変化": +1,
+            "金価格変化率": +1,
+            "クロスΓ[株式×FX]": +1, "クロスΓ[流動性×株式]": +1,
+            "市場流動性指数変化(Amihud)": +1, "株式ビッドアスクSP変化": +1,
+            "システミックリスク指数変化": +1,
+        },
+        "color": "#7c3aed",
+        "desc": "世界的な信用収縮でリスク資産が売られ安全資産（円・JGB・金）に資金集中。"
+                "SABRのν（ボラのボラ）が急上昇し、オプションの非線形損益（ガンマ・ベガ）が爆発的に増幅。"
+                "Vanna-Volga効果でPut側の暗示IVが構造的に上昇し、テールリスクヘッジコストが急騰する。",
+        "delta_impact":  "▶ 全株式Δ：TOPIX▲10〜15%・S&P500▲8〜12%の連動下落\n▶ FXΔ：USD/JPY▲5〜8%（リスクオフ円買い）・AUD/JPY▲8%超（資源通貨売り）",
+        "gamma_impact":  "▶ 株式Γ：売りが売りを呼ぶ展開。デルタヘッジ先物売りが下落加速\n▶ SABR ν急騰：ガンマスキャルピングのヘッジコストが急増\n▶ クロスΓ全般：全アセットクラスの相関が1に収束し分散効果が消滅",
+        "vega_impact":   "▶ VIX+20〜30pts（リーマン級では+40以上）：ショートボラ戦略が爆損\n▶ SABR α急上昇・ρ急低下：IVスマイルが極度にスティープ化\n▶ VV Vanna急上昇：FXオプションの非線形損益が急拡大",
+        "credit_impact": "▶ HY CDX+100〜200bps：ジャンク債流動性枯渇\n▶ 欧州iTraxx拡大：グローバル連鎖的なスプレッド拡大",
+        "regulatory":    "▶ Basel III LCR：HQLA確保のための資産売却圧力\n▶ NSFR：長期資産の短期調達依存企業でリファイナンスリスク顕在化\n▶ FRTB IMA：ボラサーフェス急変でSES（ストレスシナリオ損失）が急増",
+        "contagion":     "米国リスク資産売り → 新興国キャリー巻き戻し → 円高急進 → 日本株外国人売り → 流動性スパイラル → 全資産下落",
+        "hedge": {
+            "優先度1【ポートフォリオ保護】": "TOPIX/S&P500 深いOTMプット購入（Delta-Gamma中立化）\nVIX先物ロング（ただしコンタンゴでのロールコスト：月▲5〜15%に注意）",
+            "優先度2【ガンマ/ベガヘッジ】":  "プットスプレッド（ATM Put買い＋OTM Put売り）でコスト抑制\nVIXコールスプレッドでVIX上昇をキャップ付きでヘッジ\nSABR ν上昇ヘッジ：バリアンススワップ（短期）",
+            "優先度3【FXヘッジ】":          "USD/JPY Put購入（Vanna-Volga価格調整後のFair Value比較）\nUSD/JPY 25ΔRR購入でテールヘッジ\n新興国通貨：ノンデリバラブルフォワード（NDF）で円換算リスクヘッジ",
+            "優先度4【クレジット/流動性】":  "CDSプロテクション（iTraxx/CDX）購入でクレジットヘッジ\nHQLA（JGB・国債）へのポートフォリオシフト（LCR対応）\n流動性バッファー拡充：現金比率を平常時+10%程度引き上げ",
+            "コスト試算":                  "プット購入：AUMの1〜2%/半期\nVIX先物：ロールコスト含め月0.5〜1.5%\nCDS：年間プレミアム0.5〜1.5%(IG)・2〜5%(HY)",
+            "注意事項":                    "⚠ リーマン級（VIX>40）ではオプション市場の機能不全リスクあり\n⚠ 流動性枯渇時はヘッジ執行コストが平常時の5〜10倍に膨らむ\n⚠ バリアンススワップのコンベクシティリスクに注意",
+        },
+        "prob": "低（テールリスク、5〜10年に1度）",
+        "hist": "2008年リーマン（VIX+80）、2020年コロナショック（VIX+66）",
+        "trader_note": "プロテクティブPUTの購入が最優先。流動性バッファーを平常時の2倍確保。",
+    },
+    "スタグフレーション": {
+        "signs": {
+            "TOPIX変化率": -1, "日経225変化率": -1, "S&P500連動変化率": -1,
+            "バリュー/グロース スプレッド": -1,
+            "VIX水準変化": +1, "VVIX(ボラのボラ)変化": +1,
+            "日本株IV ATM 1M変化": +1, "日本株IV ATM 3M変化": +1,
+            "USD/JPY変化率": +1,
+            "2Y JGB金利変化": +1, "5Y JGB金利変化": +1,
+            "10Y JGB金利変化": +1, "20Y JGB金利変化": +1,
+            "YCスティープ(2Y-10Y)変化": +1,
+            "スワップション1Y1Y IV変化": +1, "スワップション5Y5Y IV変化": +1,
+            "日本IG CDS 5Y変化": +1, "日本HY CDS 5Y変化": +1,
+            "BBB格フォーリングエンジェル": +1,
+            "原油(WTI 1M)変化率": +1, "原油(WTI 12M)変化率": +1,
+            "天然ガス価格変化率": +1, "農産物指数変化率": +1,
+            "クロスΓ[株式×金利]": +1,
+            "CPIインフレ率変化": +1, "製造業PMI変化": -1,
+        },
+        "color": "#f97316",
+        "desc": "景気後退と物価上昇が同時進行。金利上昇でグロース株のDCFバリュエーションが崩壊。"
+                "スワップション市場でのIV上昇（金利SABR ν急騰）が金利リスク管理コストを押し上げる。"
+                "コモディティの期間構造がバックワーデーションからコンタンゴへ転換する可能性もある。",
+        "delta_impact":  "▶ 株式Δ：グロース・テック株が最大被弾（割引率上昇でバリュエーション消滅）\n▶ 円安進行：資源輸入コスト急増が製造業マージンを圧縮",
+        "gamma_impact":  "▶ 株式Γ：景気後退確認前後のボラ上昇が非線形損失を増幅\n▶ クロスΓ[株式×金利]：金利上昇が株価押し下げ、その損失が金利リスクを更に増幅",
+        "vega_impact":   "▶ スワップションIV急騰：金利SABR νパラメータの急上昇\n▶ 日本株IV高止まり：スタグフレーション長期化懸念で構造的にIVが上昇",
+        "credit_impact": "▶ BBB格フォーリングエンジェルリスク急浮上：企業収益悪化→ダウングレード→スプレッド拡大\n▶ コベナンツ抵触リスク：金利上昇×収益悪化のダブルパンチ",
+        "regulatory":    "▶ Basel III IRRBB：資産・負債のリプライシングギャップ拡大でNII変動\n▶ Pillar 2：スタグフレーションは規制当局が要求するRSTの典型シナリオ",
+        "contagion":     "原油高騰 → 輸入コスト急増 → 企業収益圧縮 → 設備投資削減 → 雇用悪化 → 消費減退 → 更なる景気後退 → 財政悪化 → 金利上昇圧力",
+        "hedge": {
+            "優先度1【インフレヘッジ】":   "物価連動国債（JGBi/TIPS）購入：インフレ実質収益をロック\n原油先物ロング・コモディティETF（GSCI等）でインフレヘッジ",
+            "優先度2【デュレーションヘッジ】": "JGB先物ショート（10Y・20Y）：金利上昇ヘッジ\n金利スワップ（固定受け→変動払い）：IRRBB管理\nスワップション（ペイヤー）：金利上昇オプション性ヘッジ",
+            "優先度3【株式ヘッジ】":       "グロース株の大幅縮小・バリュー株・資源株へのローテーション\nTOPIX先物ショートでベータヘッジ",
+            "優先度4【セクター】":         "エネルギー・素材・農業関連株へのセクターローテーション\n金現物・金ETFロングで購買力保全",
+            "コスト試算":                 "物価連動JGBi：流動性プレミアムとして通常JGBより利回りが約0.2〜0.5%低い\nJGB先物ショート：証拠金コスト＋ロールコスト 年率0.1〜0.3%\n原油先物：コンタンゴ時のロールコストに注意（月▲1〜3%）",
+            "注意事項":                   "⚠ スタグフレーションは通常の資産配分の「逃げ場なし」局面\n⚠ 実物資産・コモディティへの分散が数少ない防御手段\n⚠ 利上げ期間の長期化を前提にデュレーション管理を見直す",
+        },
+        "prob": "低〜中（構造的リスク）",
+        "hist": "1970年代オイルショック後、1980年代初頭米国（フォルカー・ショック前後）",
+        "trader_note": "実物資産・資源関連への分散が唯一の防御策。デュレーション短縮が急務。",
+    },
+    "日銀サプライズ引き締め": {
+        "signs": {
+            "TOPIX変化率": -1, "日経225変化率": -1, "TOPIX小型株変化率": -1,
+            "セクター[不動産]相対騰落": -1, "セクター[金融]相対騰落": +1,
+            "日本株IV ATM 1M変化": +1, "SABR α(ボラ水準)変化": +1,
+            "USD/JPY変化率": -1, "EUR/JPY変化率": -1,
+            "1M JGB金利変化": +1, "3M JGB金利変化": +1,
+            "1Y JGB金利変化": +1, "2Y JGB金利変化": +1,
+            "5Y JGB金利変化": +1, "10Y JGB金利変化": +1,
+            "YCスティープ(2Y-10Y)変化": +1,
+            "スワップション1Y1Y IV変化": +1, "スワップション5Y5Y IV変化": +1,
+            "日本IG CDS 5Y変化": +1, "不動産セクターCDS変化": +1,
+            "TONAR-OISスプレッド変化": +1, "日米金利差(10Y)変化": -1,
+            "クロスΓ[株式×金利]": +1,
+            "実質GDP成長率変化": -1,
+        },
+        "color": "#eab308",
+        "desc": "日銀が市場予想を超える利上げを実施。円高急進と長期金利上昇が同時進行。"
+                "スワップション（金利オプション）市場でIVが急上昇し、金利SABR αパラメータが跳ね上がる。"
+                "J-REITはキャップレート上昇で資産価値が急低下し、NAV割れによる強制売却圧力が増す。",
+        "delta_impact":  "▶ 不動産・公益事業：キャップレート上昇で資産価値急落（最大▲20〜30%）\n▶ FXΔ：USD/JPY▲3〜5%（日米金利差縮小）",
+        "gamma_impact":  "▶ 不動産・グロースセクター：ポジション解消が自己強化的に進行\n▶ クロスΓ[株式×金利]：金利上昇が株価押し下げ、株安が金利リスクを更に増幅",
+        "vega_impact":   "▶ スワップションIV急騰：日銀サプライズで金利ボラが急上昇\n▶ 金利SABR：α急上昇・ν上昇でペイヤースワップションが急騰",
+        "credit_impact": "▶ TONAR-OIS拡大：銀行間資金調達コスト上昇\n▶ J-REIT CDS：NAV割れ→強制売却→スプレッド急拡大の連鎖",
+        "regulatory":    "▶ Basel III IRRBB：金利リスク感応度（NII・EVE変化）が規制当局監視強化対象に\n▶ 保険会社：ソルベンシー比率が金利感応型負債の時価変動で急悪化",
+        "contagion":     "日銀利上げ決定 → 円高急進 → 外国人の円建て資産買い・日本株売り → 不動産REIT強制売却 → 信用収縮 → 内需株下落 → 景気後退懸念台頭",
+        "hedge": {
+            "優先度1【金利ヘッジ】":       "JGB先物ショート（2Y・10Y・20Y）：デュレーションニュートラル化\n金利スワップ（固定受け変動払い）：利上げシナリオに対するALMヘッジ\nペイヤースワップション（1Y1Y・5Y5Y）：更なる利上げオプション性ヘッジ",
+            "優先度2【株式ヘッジ】":       "不動産・公益事業のポジション大幅削減またはショート\n銀行株ロング（NIM拡大）＋不動産ショートのペアトレード\nTOPIX先物でベータヘッジ",
+            "優先度3【FXヘッジ】":         "USD/JPY先物ロング（円高ヘッジ）またはコール購入\nドル建て外貨資産のFXフォワードヘッジ比率引き上げ",
+            "優先度4【クレジット】":        "J-REIT CDSプロテクション購入\nHY格社債の早期削減",
+            "コスト試算":                  "JGB先物ショート：証拠金コスト＋スリッページ 年率0.1〜0.2%\nペイヤースワップション：プレミアム0.3〜0.8%（1Y1Y、ATM）\n銀行ロング/不動産ショート：ショートのボロコスト0.1〜0.3%/年",
+            "注意事項":                    "⚠ 銀行セクターはNIM拡大でロングカバー継続（ヘッジ対象外）\n⚠ 利上げペース次第でポジション動的調整が必要\n⚠ J-REITの流動性が低下している局面では執行コストが急上昇",
+        },
+        "prob": "中（YCC完全撤廃・追加利上げ加速シナリオ）",
+        "hist": "2024年3月・7月の日銀利上げ局面、2006〜07年量的緩和解除",
+        "trader_note": "銀行ロング継続。不動産・公益事業は即座にショート検討。",
+    },
+    "米国景気後退波及": {
+        "signs": {
+            "TOPIX変化率": -1, "日経225変化率": -1, "TOPIX小型株変化率": -1,
+            "S&P500連動変化率": -1, "MSCI Asia ex-Japan変化率": -1,
+            "TOPIX急落加速[ガンマ]": +1,
+            "セクター[情報技術]相対騰落": -1,
+            "モメンタムファクター": -1, "サイズファクター(小-大型)": -1,
+            "VIX水準変化": +1, "VVIX(ボラのボラ)変化": +1,
+            "日本株IV ATM 1M変化": +1,
+            "USD/JPY変化率": -1, "AUD/JPY変化率": -1, "新興国通貨指数変化率": -1,
+            "FX Vanna(∂²V/∂S∂σ)変化": +1,
+            "1Y JGB金利変化": -1, "2Y JGB金利変化": -1,
+            "10Y JGB金利変化": -1, "日米金利差(10Y)変化": -1,
+            "米国IG CDX変化": +1, "米国HY CDX変化": +1,
+            "日本HY CDS 5Y変化": +1,
+            "銅価格変化率": -1, "鉄鉱石価格変化率": -1,
+            "クロスΓ[株式×FX]": +1,
+            "製造業PMI変化": -1, "実質GDP成長率変化": -1,
+        },
+        "color": "#3b82f6",
+        "desc": "米国リセッション入りが確認され輸出依存の高い日本企業が直撃を受ける。"
+                "FRBの利下げ期待から円キャリートレードが巻き戻され円高圧力が強まる。"
+                "Vanna効果でFXオプションの非線形損益が拡大し、ヘッジコストが急騰する。",
+        "delta_impact":  "▶ 輸出セクター（自動車・機械）が最大被弾：S&P500連動で連れ安\n▶ FXΔ：FRB利下げ→日米金利差縮小→円高（USD/JPY▲5〜8%）",
+        "gamma_impact":  "▶ 小型株Γ：米国景気敏感セクターが集中する小型株で急落加速\n▶ クロスΓ[株式×FX]：円高が輸出株EPS（1円円高≈0.5〜1%EPS減）を直撃",
+        "vega_impact":   "▶ VIX+10〜20pts：景気後退確認前後の不確実性スパイク\n▶ FX Vanna急上昇：円プットのVanna効果でヘッジコストが非線形に増加",
+        "credit_impact": "▶ 米国HY CDX+100〜200bps：デフォルト率上昇。小売・輸送が直撃\n▶ 日本輸出企業：ダウングレードリスクでスプレッド緩やかに拡大",
+        "regulatory":    "▶ Basel III P2シナリオ：米国景気後退は規制当局が明示する「重大な下方シナリオ」典型例\n▶ グローバル銀行：米国子会社経由でCCAR/DFASTのストレス試験も影響",
+        "contagion":     "FRB利下げ観測 → 円高進行 → 円キャリー巻き戻し → 輸出企業業績下方修正 → 外国人日本株売り → アジア新興国波及 → グローバル資本フロー逆転",
+        "hedge": {
+            "優先度1【株式ヘッジ】":        "輸出セクター（自動車・電機・機械）の大幅削減またはショート\nTOPIX先物ショート（景気敏感ベータヘッジ）\nS&P500連動ETFプット購入（米国景気後退のテールヘッジ）",
+            "優先度2【FXヘッジ】":          "USD/JPY先物ロング（円高ヘッジ）またはコール購入\nVanna-Volga調整済みFXオプション：25ΔRR（円コール）購入でVanna効果ヘッジ\nAUD/JPY・新興国通貨ショート（資源通貨の下落ヘッジ）",
+            "優先度3【金利ヘッジ】":         "JGB先物ロング（FRB利下げ連動・安全資産フライト）\n米国債先物ロング（FRB利下げへの直接エクスポージャー）",
+            "優先度4【セクター】":            "内需・防衛・医療への相対的避難\nコモディティ（銅・鉄鉱石）ショートで景気後退の直接受益",
+            "コスト試算":                   "USD/JPY コール購入：プレミアム0.3〜0.8%（ATM、1M）\nS&P500プット：AUMの0.5〜1.0%（OTM 5%、3M）\nJGB先物ロング：証拠金コスト 年率0.05〜0.1%",
+            "注意事項":                     "⚠ 景気後退確認後にFRBが急速利下げに転じると、円高とJGB上昇が同時進行\n⚠ 輸出株と円高ヘッジの組み合わせでポートフォリオ全体のリスクを評価\n⚠ 新興国通貨のNDFは流動性制約に注意",
+        },
+        "prob": "中（2025〜2026年リスクシナリオ）",
+        "hist": "2001年ITバブル崩壊（円高+テック株崩壊）、2008年リーマン前後（円78円台）",
+        "trader_note": "輸出株のデルタヘッジが急務。内需・防衛・医療は相対的避難先。",
+    },
+    "金融システム不安": {
+        "signs": {
+            "TOPIX変化率": -1, "日経225変化率": -1, "セクター[金融]相対騰落": -1,
+            "TOPIX急落加速[ガンマ]": +1,
+            "VIX水準変化": +1, "VVIX(ボラのボラ)変化": +1,
+            "日本株IV ATM 1M変化": +1, "ボラスキュー(25ΔPut側)変化": +1,
+            "SABR ρ(ボラ-原資産相関)変化": -1,
+            "1M JGB金利変化": +1, "3M JGB金利変化": +1,
+            "TONAR-OISスプレッド変化": +1,
+            "日本IG CDS 5Y変化": +1, "日本HY CDS 5Y変化": +1,
+            "米国IG CDX変化": +1, "米国HY CDX変化": +1,
+            "金融セクターCDS変化": +1, "シニア-サブSP変化": +1,
+            "デフォルト相関変化": +1,
+            "金価格変化率": +1,
+            "市場流動性指数変化(Amihud)": +1, "株式ビッドアスクSP変化": +1,
+            "社債市場流動性変化": +1,
+            "Put/Call比変化(センチメント)": +1, "システミックリスク指数変化": +1,
+            "クロスΓ[流動性×株式]": +1,
+        },
+        "color": "#ef4444",
+        "desc": "特定金融機関の信用不安がインターバンク市場に波及。TONAR-OISスプレッドが急拡大。"
+                "流動性の枯渇でAmihud流動性指数が急悪化し、ビッドアスクスプレッドが広がる。"
+                "デフォルト相関の急上昇でCDO・CLOのトランシェ損失が非線形に増幅される。",
+        "delta_impact":  "▶ 金融セクター株：PBR0.5倍以下に急落の可能性\n▶ 短期金利急騰：インターバンク金利スパイク（資金繰りリスク）",
+        "gamma_impact":  "▶ 株式Γ：金融株急落が連鎖的にポートフォリオ全体に波及\n▶ クロスΓ[流動性×株式]：流動性枯渇が株安を加速する正のフィードバック",
+        "vega_impact":   "▶ VIX急騰：流動性リスクを急速に再評価。IVスキューが急スティープ化\n▶ SABR ρ急低下：Put側IVが非線形に急騰",
+        "credit_impact": "▶ CDS急拡大：CDSプロテクション需要の急増でプレミアム急騰\n▶ デフォルト相関：CDO/CLO のトランシェへの波及が非線形に増幅",
+        "regulatory":    "▶ Basel III LCR/NSFR：流動性規制比率が臨界点に近づく\n▶ G-SIB/D-SIB：追加資本バッファー発動のトリガー水準に接近\n▶ 日銀特別オペ：流動性供給オペレーションの発動が焦点",
+        "contagion":     "特定金融機関の信用不安 → インターバンク金利急騰 → 全金融機関に伝播 → 銀行信用収縮 → 実体経済波及 → 企業倒産増加 → 更なる不良債権増加",
+        "hedge": {
+            "優先度1【金融セクターヘッジ】": "金融セクター株ショート（銀行・証券・保険）\n金融セクターCDSプロテクション購入（シニア・サブ両方）\nシニア-サブ スプレッドトレード",
+            "優先度2【流動性確保】":        "HQLA（JGB現物・国債）へのポートフォリオシフト\n現金・MMF比率を大幅引き上げ（平常時+15〜20%）\nレポ取引限度額の事前確保",
+            "優先度3【テールリスクヘッジ】":"VIX先物ロング（短期IVスパイクヘッジ）\nTOPIX深いOTMプット購入（金融危機加速シナリオヘッジ）\n金現物・金ETFロング（安全資産フライト受益）",
+            "優先度4【金利ヘッジ】":        "TONAR-OISスプレッド拡大ヘッジ：短期金利スワップ\nJGB先物ロング（安全資産フライト受益）",
+            "コスト試算":                  "金融CDS：危機時プレミアムは平常時の5〜10倍（100→500bps超）\nVIX先物：危機時はコンタンゴが逆転（バックワーデーション）でロールゲイン\n現金保有コスト：機会費用として運用収益の低下を甘受",
+            "注意事項":                    "⚠ CDS取引の相手方リスク（カウンターパーティリスク）に注意\n⚠ 流動性枯渇時はヘッジ執行そのものが困難になる\n⚠ 日銀特別オペの発動後は短期金利が急速に正常化することも",
+        },
+        "prob": "低（テールリスク、5〜15年に1度）",
+        "hist": "2023年SVB破綻・クレディ・スイス救済、2016年伊銀行危機、2008年リーマン破綻",
+        "trader_note": "金融セクター集中リスクを即評価。TONAR/TONARRの動向を監視。",
+    },
+    "地政学リスク急発生": {
+        "signs": {
+            "TOPIX変化率": -1, "日経225変化率": -1,
+            "S&P500連動変化率": -1, "MSCI Asia ex-Japan変化率": -1,
+            "TOPIX急落加速[ガンマ]": +1,
+            "セクター[エネルギー]相対騰落": +1,
+            "VIX水準変化": +1, "VIX期間構造(VIX3M-VIX)変化": -1,
+            "日本株IV ATM 1M変化": +1,
+            "ボラスキュー(25ΔPut側)変化": +1,
+            "USD/JPY 25ΔRR 1M変化[VV]": -1,
+            "原油(WTI 1M)変化率": +1, "原油(WTI 12M)変化率": +1,
+            "原油期間構造(12M-1M)変化": -1,
+            "天然ガス価格変化率": +1, "金価格変化率": +1, "銀価格変化率": +1,
+            "日本IG CDS 5Y変化": +1, "日本HY CDS 5Y変化": +1,
+            "コモディティOVX変化": +1,
+            "CPIインフレ率変化": +1, "製造業PMI変化": -1,
+        },
+        "color": "#f97316",
+        "desc": "突発的な地政学リスクにより市場が急変動。資源国リスクが高まり原油・金が急騰。"
+                "VIX期間構造が急速に逆転（フロントVIXがVIX3Mを上回る）し、短期IVスパイクが起きる。"
+                "Vanna-Volga効果でFXオプションのリスクリバーサルが急変動する。",
+        "delta_impact":  "▶ 航空・観光・輸送・製造業が直撃。防衛・エネルギーは逆に上昇\n▶ コモディティデルタ：原油・天然ガス急騰でエネルギーロングが大幅益",
+        "gamma_impact":  "▶ 株式Γ：サプライズの大きさに比例して非線形損失が拡大\n▶ コモディティΓ：OVX（原油ボラ）急騰でエネルギーオプションが非線形反応",
+        "vega_impact":   "▶ VIX急騰・期間構造逆転：短期IVスパイクで期近オプションが急騰\n▶ VV効果：FXリスクリバーサルが急スティープ化し、ヘッジコストが非線形増加",
+        "credit_impact": "▶ 関連地域エクスポージャー企業：CDS急拡大\n▶ エネルギー関連HY：供給不安で価格上昇→スプレッドが逆に縮小するケースも",
+        "regulatory":    "▶ 制裁・資産凍結リスク：関連国資産保有企業に取引制限の可能性\n▶ オペリスク資本：サイバー攻撃・物理インフラ障害でオペリスク資本要件上昇",
+        "contagion":     "地政学リスク発生 → 原油・資源急騰 → インフレ懸念再燃 → 中央銀行対応困難化 → 製造業サプライチェーン混乱 → 景気後退リスク台頭 → リスクオフ連鎖",
+        "hedge": {
+            "優先度1【地政学ヘッジ】":     "防衛関連株ロング、航空・観光ショートのペアトレード\n原油先物ロング（エネルギー価格上昇の直接受益）\n金ETF・金現物ロング（有事の金）",
+            "優先度2【ボラヘッジ】":        "短期VIX先物ロング（期間構造逆転を利用）\nフロント月プット購入（短期IVスパイクヘッジ）\nVanna-Volga調整済みFXオプション：25ΔRR購入",
+            "優先度3【サプライチェーン】":  "製造業サプライチェーン混乱を受けやすい銘柄のショート\n代替調達可能な素材・中間財への分散",
+            "優先度4【通貨ヘッジ】":        "有事の円高ヘッジ：USD/JPY コールまたは先物ロング\n資源通貨（AUD/JPY等）のショート",
+            "コスト試算":                  "原油先物：委託証拠金＋ロールコスト 月0.1〜0.5%\n金ETF：信託報酬0.2〜0.5%/年\nVIXフロント先物：地政学リスク時はバックワーデーション化でロールゲイン",
+            "注意事項":                    "⚠ 地政学リスクは短期（数週間）でVIXが急低下することも多い\n⚠ 原油先物はバックワーデーション/コンタンゴ転換に注意\n⚠ 防衛株は輸出規制の対象になり得るため規制リスクに注意",
+        },
+        "prob": "低〜中（常在リスク、2〜5年に1度の高強度イベント）",
+        "hist": "2022年ロシア・ウクライナ侵攻（原油+40%）、2023〜24年中東紛争激化",
+        "trader_note": "防衛・エネルギーロング、航空・観光ショートが典型。VIX期間構造の逆転に注目。",
+    },
+    "ブラックスワン（複合危機）": {
+        "signs": {
+            "TOPIX変化率": -1, "日経225変化率": -1, "TOPIX小型株変化率": -1,
+            "S&P500連動変化率": -1, "EuroSTOXX50変化率": -1,
+            "MSCI Asia ex-Japan変化率": -1, "中国株(CSI300)変化率": -1,
+            "TOPIX急落加速[ガンマ]": +1, "日経オプションガンマ": +1,
+            "VIX水準変化": +1, "VVIX(ボラのボラ)変化": +1,
+            "日本株IV ATM 1M変化": +1, "日本株IV ATM 3M変化": +1,
+            "SABR α(ボラ水準)変化": +1, "SABR ρ(ボラ-原資産相関)変化": -1,
+            "SABR ν(ボラのボラ)変化": +1,
+            "ボラスキュー(25ΔPut側)変化": +1, "ボラカートシス変化": +1,
+            "USD/JPY変化率": +1, "EUR/JPY変化率": +1,
+            "USD/JPY 25ΔRR 1M変化[VV]": -1,
+            "FX Vanna(∂²V/∂S∂σ)変化": +1, "FX Volga(∂²V/∂σ²)変化": +1,
+            "2Y JGB金利変化": +1, "10Y JGB金利変化": +1,
+            "スワップション1Y1Y IV変化": +1,
+            "日本IG CDS 5Y変化": +1, "日本HY CDS 5Y変化": +1,
+            "米国HY CDX変化": +1, "欧州iTraxx Main変化": +1,
+            "デフォルト相関変化": +1, "BBB格フォーリングエンジェル": +1,
+            "原油(WTI 1M)変化率": +1, "金価格変化率": +1,
+            "市場流動性指数変化(Amihud)": +1, "社債市場流動性変化": +1,
+            "システミックリスク指数変化": +1,
+            "クロスΓ[株式×FX]": +1, "クロスΓ[株式×金利]": +1,
+            "クロスΓ[原油×FX]": +1, "クロスΓ[流動性×株式]": +1,
+        },
+        "color": "#1e293b",
+        "desc": "108全ファクターが同時に最悪方向へ振れる複合危機。7^108≈10^91通りの探索空間で"
+                "量子アニーリングのみが発見可能な究極のテールシナリオ。SABR/VV/クロスΓの全パラメータが"
+                "同時に最悪化し、損失は線形近似の5〜10倍以上に膨らむ可能性がある。",
+        "delta_impact":  "▶ 全株式Δ：TOPIX▲20〜30%・S&P500▲20%の同時暴落\n▶ FXΔ：ドル高・円高・ユーロ安が同時進行（複合通貨危機）",
+        "gamma_impact":  "▶ VIX>60：通常のデルタヘッジが機能せず、ガンマ損失が爆発的に拡大\n▶ SABR ν最大化：全クロスΓが同時に最大化し、分散効果が完全消滅\n▶ 全アセット相関が1に収束：ポートフォリオ理論が機能しなくなる",
+        "vega_impact":   "▶ VIX+40〜60pts超：オプション市場の機能不全リスク\n▶ VVIX 200超：ガンマスキャルピングが成立しなくなる\n▶ VV Volga最大化：FXオプション非線形損益が爆発的増幅",
+        "credit_impact": "▶ HY CDX+500bps超：企業債務市場が実質閉鎖\n▶ デフォルト相関が1に収束：CDO/CLOのトランシェが全滅",
+        "regulatory":    "▶ 緊急流動性支援（ELA）・特別オペ発動：各国中央銀行が非常措置\n▶ バーゼルIII全指標が同時悪化：資本・流動性・レバレッジの全比率が臨界点\n▶ FSBが国際協調を要請するシナリオ",
+        "contagion":     "初期ショック → 流動性の枯渇 → 強制ポジション解消 → 全相関が1に収束 → リアルマネー損失確定 → 実体経済への深刻な波及 → 財政出動・QE発動 → 数年単位の回復",
+        "hedge": {
+            "優先度1【緊急流動性確保】":    "現金・HQLA比率を最大化（ポートフォリオの30〜50%）\n超短期国債（T-Bill/3M JGB）へ全シフト\nレポ取引・信用枠の事前確保",
+            "優先度2【テールリスクヘッジ】":"深いOTMプット購入（TOPIX▲30%、S&P500▲30%水準）\nバリアンススワップ短期ロング\nVIX先物フロント月ロング",
+            "優先度3【相関ブレイクヘッジ】":"分散効果消滅を前提にポートフォリオ全体をヘッジ\n全株式ポジションに対するデルタヘッジ（先物ショート）\nSABR/VVパラメータ変化でヘッジ比率を動的調整",
+            "優先度4【その他資産】":        "金現物保有（流動性危機時はETFより現物が安全）\n不動産・インフラ等の非流動性資産は即時対応不可\n暗号資産は流動性枯渇時に相関が急上昇するため不適",
+            "コスト試算":                  "通常のヘッジ戦略はほぼ機能しない：コスト試算の意味が薄い\n事前に購入した深いOTMプット：プレミアム0.1〜0.3%/月（平常時に安く購入が必須）\nバリアンススワップ：VIX20時に購入、VIX60で価値が6〜9倍に",
+            "注意事項":                    "⚠ 通常のヘッジ戦略は複合危機では機能しない\n⚠ キャッシュ比率引き上げが最優先かつ唯一確実な防御手段\n⚠ 事前（平常時）に購入したプット・VIXオプションのみが有効\n⚠ ヘッジ手段の流動性自体が枯渇するリスクに備える",
+        },
+        "prob": "極低（1〜2%、テール確率・100年に1〜2度）",
+        "hist": "2008年リーマンショック後の数週間、1929年世界大恐慌初期局面",
+        "trader_note": "エマージェンシーヘッジの発動基準として設定。キャッシュ比率引き上げが最優先。",
+    },
+    "金融引き締め過剰（オーバーキル）": {
+        "signs": {
+            "TOPIX変化率": -1, "日経225変化率": -1,
+            "バリュー/グロース スプレッド": -1,
+            "セクター[不動産]相対騰落": -1,
+            "日本株IV ATM 1M変化": +1,
+            "USD/JPY変化率": -1,
+            "2Y JGB金利変化": +1, "5Y JGB金利変化": +1,
+            "10Y JGB金利変化": +1, "YCスティープ(2Y-10Y)変化": +1,
+            "スワップション1Y1Y IV変化": +1, "スワップション5Y5Y IV変化": +1,
+            "日本HY CDS 5Y変化": +1, "BBB格フォーリングエンジェル": +1,
+            "クロスΓ[株式×金利]": +1,
+            "実質GDP成長率変化": -1,
+        },
+        "color": "#dc2626",
+        "desc": "中央銀行の過剰引き締めが景気後退を引き起こす局面。金利SABR αが最大化し、"
+                "スワップション市場でペイヤー（金利上昇ヘッジ）の需要が急増。"
+                "BBB格企業のフォーリングエンジェルリスクが高まりHY市場が拡大する。",
+        "delta_impact":  "▶ グロース・不動産・ハイレバ企業で最大下落\n▶ FXΔ：日米金利差縮小で円高進行",
+        "gamma_impact":  "▶ 株式Γ：引き締め過剰認識が広まると急落加速\n▶ クロスΓ[株式×金利]：金利上昇→株安→実体経済悪化→更なる金利懸念の悪循環",
+        "vega_impact":   "▶ スワップションIV急騰：政策不確実性で金利ボラが上昇\n▶ 日本株IV：政策リスクからボラが上昇",
+        "credit_impact": "▶ HY急拡大：借入コスト急増でゾンビ企業のデフォルト率急上昇\n▶ BBB格フォーリングエンジェル：ダウングレードの連鎖",
+        "regulatory":    "▶ Basel III IRRBB：EVE（経済的価値）急減少が規制警告水準に\n▶ 保険会社：ソルベンシー比率が金利感応型負債の時価変動で急悪化",
+        "contagion":     "中央銀行の過剰引き締め → ハイレバ企業の資金繰り悪化 → デフォルト増加 → 銀行不良債権増大 → 信用収縮 → 景気後退入り → 急速な利下げへの転換",
+        "hedge": {
+            "優先度1【金利ヘッジ】":        "JGB先物ショート（2Y・10Y）：デュレーションニュートラル化\nペイヤースワップション（1Y1Y・5Y5Y）：更なる引き締めオプション性ヘッジ\n金利スワップ（固定受け変動払い）",
+            "優先度2【株式ヘッジ】":         "グロース株・不動産の大幅削減\nTOPIX先物でベータヘッジ",
+            "優先度3【クレジット】":          "HY格社債の削減・CDSプロテクション購入\nBBB格モニタリング強化・フォーリングエンジェルの早期検知",
+            "コスト試算":                   "ペイヤースワップション：プレミアム0.2〜0.6%（1Y1Y ATM）\nCDSプロテクション：年間0.5〜1.5%（IG）",
+            "注意事項":                     "⚠ 利下げへの急転換が起きると、金利ショートポジションが逆回転\n⚠ 政策転換のタイミングを見極めることが最重要",
+        },
+        "prob": "低〜中（金融政策リスク）",
+        "hist": "1994年FRB急速利上げ（メキシコ危機誘発）、1980年代初頭フォルカー・ショック",
+        "trader_note": "デュレーションの長い債券のヘッジが最優先。グロース株のポジション削減。",
+    },
+}
+# ══════════════════════════════════════════════════════════════════════════════
+# ══════════════════════════════════════════════════════════════════════════════
+# CSS ── Glassmorphism × Quantum Finance Premium UI
+# ══════════════════════════════════════════════════════════════════════════════
+st.markdown("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;500;600;700;800&family=JetBrains+Mono:wght@400;600&family=Noto+Sans+JP:wght@300;400;500;700&display=swap');
+
+/* ══════════════════════════════════════════════
+   ベースリセット & グローバル
+══════════════════════════════════════════════ */
+html, body, [data-testid="stAppViewContainer"] {
+    font-family: 'Inter', 'Noto Sans JP', sans-serif;
+    background: #050d1a;
+    color: #e2e8f0;
+}
+[data-testid="stAppViewContainer"] > .main {
+    background: linear-gradient(135deg, #060e1d 0%, #0a1628 40%, #071020 100%);
+    min-height: 100vh;
+}
+/* メインコンテンツ幅 */
+.block-container {
+    padding: 1.5rem 2.5rem 3rem !important;
+    max-width: 1280px !important;
+}
+
+/* ══════════════════════════════════════════════
+   サイドバー
+══════════════════════════════════════════════ */
+[data-testid="stSidebar"] {
+    background: linear-gradient(180deg, #040b16 0%, #081323 50%, #040b16 100%) !important;
+    border-right: 1px solid rgba(0,200,230,0.15);
+}
+[data-testid="stSidebar"]::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 3px;
+    background: linear-gradient(90deg, #00c8e8, #7b2fbe, #00c8e8);
+    background-size: 200% 100%;
+    animation: shimmer 3s linear infinite;
+}
+[data-testid="stSidebar"] * { color: #ffffff !important; }
+[data-testid="stSidebar"] label,
+[data-testid="stSidebar"] .stSelectbox label,
+[data-testid="stSidebar"] .stSlider label { color: #94a3b8 !important; font-size: 0.72rem !important; font-weight: 600 !important; letter-spacing: 0.8px !important; text-transform: uppercase !important; }
+[data-testid="stSidebar"] hr { border-color: rgba(0,200,230,0.1) !important; }
+[data-testid="stSidebar"] .stButton > button {
+    background: linear-gradient(135deg, #00c8e8 0%, #0080ff 100%) !important;
+    color: #fff !important;
+    border: none !important;
+    font-weight: 700 !important;
+    letter-spacing: 0.5px !important;
+    border-radius: 8px !important;
+    box-shadow: 0 0 20px rgba(0,200,230,0.3) !important;
+    transition: all 0.2s !important;
+}
+[data-testid="stSidebar"] .stButton > button:hover {
+    box-shadow: 0 0 30px rgba(0,200,230,0.5) !important;
+    transform: translateY(-1px) !important;
+}
+
+/* ══════════════════════════════════════════════
+   ページタイトル
+══════════════════════════════════════════════ */
+h1, h2 { color: #e2e8f0 !important; }
+h3 { color: #cbd5e1 !important; }
+[data-testid="stMarkdownContainer"] h1 {
+    font-size: 1.9rem !important;
+    font-weight: 800 !important;
+    background: linear-gradient(135deg, #00c8e8 0%, #a78bfa 60%, #38bdf8 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+    letter-spacing: -0.5px;
+    margin-bottom: 0.2rem !important;
+}
+
+/* ══════════════════════════════════════════════
+   Streamlit ネイティブウィジェット
+══════════════════════════════════════════════ */
+/* メトリクスカード */
+[data-testid="metric-container"] {
+    background: rgba(255,255,255,0.03) !important;
+    border: 1px solid rgba(0,200,230,0.15) !important;
+    border-radius: 12px !important;
+    padding: 1rem 1.2rem !important;
+    backdrop-filter: blur(10px) !important;
+    transition: all 0.2s !important;
+}
+[data-testid="metric-container"]:hover {
+    border-color: rgba(0,200,230,0.4) !important;
+    box-shadow: 0 0 20px rgba(0,200,230,0.1) !important;
+}
+[data-testid="stMetricLabel"] { color: #94a3b8 !important; font-size: 0.68rem !important; font-weight: 600 !important; letter-spacing: 0.8px !important; text-transform: uppercase !important; }
+[data-testid="stMetricValue"] { color: #00c8e8 !important; font-family: 'JetBrains Mono', monospace !important; font-weight: 700 !important; }
+[data-testid="stMetricDelta"] { font-size: 0.72rem !important; }
+
+/* タブ */
+[data-testid="stTabs"] [role="tablist"] {
+    background: rgba(255,255,255,0.03);
+    border-radius: 10px;
+    padding: 0.25rem;
+    gap: 0.2rem;
+    border: 1px solid rgba(255,255,255,0.06);
+}
+[data-testid="stTabs"] [role="tab"] {
+    border-radius: 7px !important;
+    color: #a1aec0 !important;
+    font-size: 0.78rem !important;
+    font-weight: 500 !important;
+    padding: 0.4rem 0.8rem !important;
+    transition: all 0.2s !important;
+}
+[data-testid="stTabs"] [role="tab"][aria-selected="true"] {
+    background: linear-gradient(135deg, rgba(0,200,230,0.2), rgba(123,47,190,0.2)) !important;
+    color: #00c8e8 !important;
+    font-weight: 700 !important;
+    box-shadow: 0 0 12px rgba(0,200,230,0.15) !important;
+    border: 1px solid rgba(0,200,230,0.3) !important;
+}
+
+/* データフレーム */
+[data-testid="stDataFrame"] {
+    border-radius: 10px !important;
+    overflow: hidden !important;
+    border: 1px solid rgba(0,200,230,0.12) !important;
+}
+iframe[data-testid="stDataFrameResizable"] { background: #0a1628 !important; }
+
+/* エクスパンダー */
+[data-testid="stExpander"] {
+    background: rgba(255,255,255,0.02) !important;
+    border: 1px solid rgba(0,200,230,0.12) !important;
+    border-radius: 12px !important;
+    backdrop-filter: blur(6px) !important;
+    transition: all 0.2s !important;
+}
+[data-testid="stExpander"]:hover {
+    border-color: rgba(0,200,230,0.25) !important;
+}
+[data-testid="stExpander"] summary {
+    color: #ffffff !important;
+    font-size: 0.82rem !important;
+    font-weight: 600 !important;
+}
+/* ══════════════════════════════════════════════
+   st.table() — 暗背景テーマ対応
+   Streamlit デフォルトは白背景+黒文字なので上書き
+══════════════════════════════════════════════ */
+[data-testid="stTable"] {
+    background: transparent !important;
+}
+[data-testid="stTable"] table {
+    background: rgba(10, 22, 40, 0.85) !important;
+    border-collapse: collapse !important;
+    border-radius: 10px !important;
+    overflow: hidden !important;
+    width: 100% !important;
+    font-size: 0.83rem !important;
+}
+[data-testid="stTable"] thead tr {
+    background: rgba(0, 200, 230, 0.12) !important;
+    border-bottom: 1px solid rgba(0, 200, 230, 0.25) !important;
+}
+[data-testid="stTable"] thead th {
+    color: #00c8e8 !important;
+    font-weight: 700 !important;
+    font-size: 0.75rem !important;
+    text-transform: uppercase !important;
+    letter-spacing: 0.6px !important;
+    padding: 0.6rem 0.9rem !important;
+    border: none !important;
+    background: transparent !important;
+    white-space: nowrap !important;
+}
+[data-testid="stTable"] tbody tr {
+    border-bottom: 1px solid rgba(255, 255, 255, 0.05) !important;
+    transition: background 0.15s !important;
+}
+[data-testid="stTable"] tbody tr:hover {
+    background: rgba(0, 200, 230, 0.05) !important;
+}
+[data-testid="stTable"] tbody tr:nth-child(even) {
+    background: rgba(255, 255, 255, 0.02) !important;
+}
+[data-testid="stTable"] tbody td {
+    color: #e2e8f0 !important;
+    padding: 0.55rem 0.9rem !important;
+    border: none !important;
+    background: transparent !important;
+    vertical-align: top !important;
+    line-height: 1.5 !important;
+}
+/* 1列目（項目名）を強調 */
+[data-testid="stTable"] tbody td:first-child {
+    color: #94a3b8 !important;
+    font-weight: 600 !important;
+    white-space: nowrap !important;
+    min-width: 140px !important;
+}
+
+/* ══════════════════════════════════════════════
+   メインエリア ウィジェットラベル（全種）
+   number_input / selectbox / slider / text_input
+   multiselect / radio / date_input 等すべて対象
+══════════════════════════════════════════════ */
+[data-testid="stWidgetLabel"] p,
+[data-testid="stWidgetLabel"] label,
+[data-testid="stWidgetLabel"] span {
+    color: #e2e8f0 !important;
+    font-size: 0.85rem !important;
+    font-weight: 500 !important;
+}
+[data-testid="stNumberInput"] label,
+[data-testid="stSelectbox"] label,
+[data-testid="stMultiSelect"] label,
+[data-testid="stSlider"] label,
+[data-testid="stTextInput"] label,
+[data-testid="stTextArea"] label,
+[data-testid="stDateInput"] label,
+[data-testid="stTimeInput"] label,
+[data-testid="stFileUploader"] label,
+[data-testid="stColorPicker"] label,
+[data-testid="stRadio"] label {
+    color: #e2e8f0 !important;
+    font-weight: 500 !important;
+}
+
+/* ラジオ・チェックボックス 個々の選択肢ラベル */
+[data-testid="stRadio"] [data-testid="stMarkdownContainer"] p,
+[data-testid="stCheckbox"] [data-testid="stMarkdownContainer"] p {
+    color: #e2e8f0 !important;
+}
+
+/* ヘルプテキスト（tooltip） */
+[data-testid="stTooltipIcon"] { color: #94a3b8 !important; }
+
+/* st.caption */
+[data-testid="stCaptionContainer"] p,
+[data-testid="stCaption"] p,
+.stCaption p {
+    color: #94a3b8 !important;
+    font-size: 0.80rem !important;
+}
+
+/* st.markdown 内の通常テキスト */
+[data-testid="stMarkdownContainer"] p,
+[data-testid="stMarkdownContainer"] li {
+    color: #e2e8f0 !important;
+}
+
+/* フォームラベル */
+[data-testid="stForm"] label { color: #e2e8f0 !important; }
+
+/* multiselect タグ文字 */
+[data-testid="stMultiSelect"] span[data-baseweb="tag"] span {
+    color: #e2e8f0 !important;
+}
+
+/* number_input の数値・ステッパー */
+[data-testid="stNumberInput"] input { color: #e2e8f0 !important; }
+[data-testid="stNumberInput"] button {
+    color: #e2e8f0 !important;
+    background: rgba(255,255,255,0.06) !important;
+}
+
+/* セレクトボックス / スライダー / ナンバーインプット */
+[data-testid="stSelectbox"] > div > div,
+[data-testid="stNumberInput"] input,
+[data-testid="stTextInput"] input {
+    background: rgba(255,255,255,0.04) !important;
+    border: 1px solid rgba(0,200,230,0.2) !important;
+    color: #e2e8f0 !important;
+    border-radius: 8px !important;
+}
+[data-testid="stSelectbox"] > div > div:focus-within,
+[data-testid="stNumberInput"] input:focus,
+[data-testid="stTextInput"] input:focus {
+    border-color: rgba(0,200,230,0.6) !important;
+    box-shadow: 0 0 12px rgba(0,200,230,0.15) !important;
+}
+.stSlider [data-testid="stSlider"] { color: #00c8e8 !important; }
+.stSlider > div > div > div > div { background: #00c8e8 !important; }
+
+/* ボタン（グローバル） */
+.stButton > button {
+    background: rgba(0,200,230,0.08) !important;
+    color: #00c8e8 !important;
+    border: 1px solid rgba(0,200,230,0.3) !important;
+    border-radius: 8px !important;
+    font-weight: 600 !important;
+    font-size: 0.82rem !important;
+    transition: all 0.2s !important;
+}
+.stButton > button:hover {
+    background: rgba(0,200,230,0.15) !important;
+    box-shadow: 0 0 16px rgba(0,200,230,0.2) !important;
+    transform: translateY(-1px) !important;
+}
+.stButton > button[kind="primary"] {
+    background: linear-gradient(135deg, #00c8e8, #0080ff) !important;
+    color: #fff !important;
+    border: none !important;
+    box-shadow: 0 0 20px rgba(0,200,230,0.25) !important;
+}
+
+/* divider */
+hr { border-color: rgba(0,200,230,0.1) !important; }
+
+/* info/warning/error ボックス */
+[data-testid="stAlert"] {
+    border-radius: 10px !important;
+    border-left-width: 3px !important;
+    font-size: 0.84rem !important;
+}
+
+/* チェックボックス・トグル */
+[data-testid="stCheckbox"] label,
+[data-testid="stToggle"] label { color: #ffffff !important; font-size: 0.82rem !important; }
+
+/* プログレスバー */
+[data-testid="stProgress"] > div { background: rgba(255,255,255,0.05) !important; border-radius: 4px !important; }
+[data-testid="stProgress"] > div > div { background: linear-gradient(90deg, #00c8e8, #7b2fbe) !important; border-radius: 4px !important; }
+
+/* ══════════════════════════════════════════════
+   アニメーション
+══════════════════════════════════════════════ */
+@keyframes shimmer {
+    0%   { background-position: -200% 0; }
+    100% { background-position:  200% 0; }
+}
+@keyframes pulse-glow {
+    0%, 100% { box-shadow: 0 0 8px rgba(0,200,230,0.2); }
+    50%       { box-shadow: 0 0 20px rgba(0,200,230,0.5); }
+}
+@keyframes fadeInUp {
+    from { opacity: 0; transform: translateY(8px); }
+    to   { opacity: 1; transform: translateY(0); }
+}
+
+/* ══════════════════════════════════════════════
+   KPIカード（グラス）
+══════════════════════════════════════════════ */
+.kpi-card {
+    background: rgba(255,255,255,0.035);
+    border: 1px solid rgba(0,200,230,0.18);
+    border-radius: 14px;
+    padding: 1.1rem 1.3rem;
+    margin-bottom: 0.7rem;
+    backdrop-filter: blur(12px);
+    transition: all 0.25s cubic-bezier(0.4, 0, 0.2, 1);
+    animation: fadeInUp 0.4s ease;
+    position: relative;
+    overflow: hidden;
+}
+.kpi-card::before {
+    content: '';
+    position: absolute;
+    top: 0; left: 0; right: 0;
+    height: 2px;
+    background: linear-gradient(90deg, #00c8e8, #7b2fbe);
+    opacity: 0.8;
+}
+.kpi-card:hover {
+    transform: translateY(-2px);
+    border-color: rgba(0,200,230,0.4);
+    box-shadow: 0 8px 32px rgba(0,200,230,0.12), 0 0 0 1px rgba(0,200,230,0.08);
+}
+.kpi-card.danger::before  { background: linear-gradient(90deg, #ef4444, #f97316); }
+.kpi-card.danger  { border-color: rgba(239,68,68,0.3); }
+.kpi-card.warn::before    { background: linear-gradient(90deg, #f59e0b, #fbbf24); }
+.kpi-card.warn    { border-color: rgba(245,158,11,0.3); }
+.kpi-card.ok::before      { background: linear-gradient(90deg, #10b981, #34d399); }
+.kpi-card.ok      { border-color: rgba(16,185,129,0.3); }
+.kpi-card.info::before    { background: linear-gradient(90deg, #7b2fbe, #a78bfa); }
+.kpi-card.info    { border-color: rgba(123,47,190,0.3); }
+
+.kpi-title {
+    font-size: 0.62rem;
+    color: #475569;
+    font-weight: 700;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    margin-bottom: 0.35rem;
+}
+.kpi-value {
+    font-size: 1.7rem;
+    font-weight: 800;
+    color: #e2e8f0;
+    font-family: 'JetBrains Mono', monospace;
+    line-height: 1.1;
+    background: linear-gradient(135deg, #00c8e8, #38bdf8);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+}
+.kpi-value.red { background: linear-gradient(135deg, #ef4444, #f87171); -webkit-background-clip: text; background-clip: text; }
+.kpi-value.grn { background: linear-gradient(135deg, #10b981, #34d399); -webkit-background-clip: text; background-clip: text; }
+.kpi-value.amb { background: linear-gradient(135deg, #f59e0b, #fbbf24); -webkit-background-clip: text; background-clip: text; }
+.kpi-sub { font-size: 0.70rem; color: #475569; margin-top: 0.15rem; }
+
+/* ══════════════════════════════════════════════
+   セクションヘッダー（グロー）
+══════════════════════════════════════════════ */
+.sec-hdr {
+    background: rgba(0,200,230,0.06);
+    border: 1px solid rgba(0,200,230,0.2);
+    border-left: 3px solid #00c8e8;
+    color: #00c8e8 !important;
+    padding: 0.45rem 1rem;
+    border-radius: 0 8px 8px 0;
+    margin: 1.4rem 0 0.8rem 0;
+    font-weight: 700;
+    font-size: 0.82rem;
+    letter-spacing: 0.5px;
+    backdrop-filter: blur(8px);
+    text-shadow: 0 0 20px rgba(0,200,230,0.5);
+}
+.sec-hdr.red    { border-left-color: #ef4444; color: #ef4444 !important; background: rgba(239,68,68,0.06); border-color: rgba(239,68,68,0.2); text-shadow: 0 0 20px rgba(239,68,68,0.4); }
+.sec-hdr.amber  { border-left-color: #f59e0b; color: #f59e0b !important; background: rgba(245,158,11,0.06); border-color: rgba(245,158,11,0.2); text-shadow: 0 0 20px rgba(245,158,11,0.4); }
+.sec-hdr.green  { border-left-color: #10b981; color: #10b981 !important; background: rgba(16,185,129,0.06); border-color: rgba(16,185,129,0.2); text-shadow: 0 0 20px rgba(16,185,129,0.4); }
+.sec-hdr.purple { border-left-color: #a78bfa; color: #a78bfa !important; background: rgba(167,139,250,0.06); border-color: rgba(167,139,250,0.2); text-shadow: 0 0 20px rgba(167,139,250,0.4); }
+.sec-hdr.slate  { border-left-color: #64748b; color: #ffffff !important; background: rgba(100,116,139,0.06); border-color: rgba(100,116,139,0.2); }
+
+/* ══════════════════════════════════════════════
+   サマリーカード
+══════════════════════════════════════════════ */
+.summary-card {
+    background: rgba(255,255,255,0.025);
+    border: 1px solid rgba(255,255,255,0.07);
+    border-radius: 16px;
+    padding: 1.3rem 1.5rem;
+    margin-bottom: 0.8rem;
+    backdrop-filter: blur(16px);
+    box-shadow: 0 4px 24px rgba(0,0,0,0.3);
+    transition: all 0.3s;
+}
+.summary-card:hover { border-color: rgba(0,200,230,0.2); box-shadow: 0 8px 40px rgba(0,0,0,0.4), 0 0 20px rgba(0,200,230,0.06); }
+.summary-card-title {
+    font-size: 0.65rem;
+    font-weight: 700;
+    color: #475569;
+    text-transform: uppercase;
+    letter-spacing: 1.2px;
+    margin-bottom: 0.4rem;
+}
+.summary-card-value {
+    font-size: 2.2rem;
+    font-weight: 800;
+    font-family: 'JetBrains Mono', monospace;
+    background: linear-gradient(135deg, #e2e8f0, #ffffff);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
+}
+.drill-hint { font-size: 0.68rem; color: #94a3b8; margin-top: 0.3rem; }
+
+/* ══════════════════════════════════════════════
+   シナリオカード
+══════════════════════════════════════════════ */
+.scenario-card {
+    background: rgba(255,255,255,0.025);
+    border: 1px solid rgba(239,68,68,0.2);
+    border-left: 3px solid #ef4444;
+    border-radius: 10px;
+    padding: 0.9rem 1.1rem;
+    margin: 0.45rem 0;
+    backdrop-filter: blur(8px);
+    transition: all 0.2s;
+}
+.scenario-card:hover { transform: translateX(3px); }
+.scenario-card.amber { border-left-color: #f59e0b; border-color: rgba(245,158,11,0.2); }
+.scenario-card.blue  { border-left-color: #38bdf8; border-color: rgba(56,189,248,0.2); }
+.scenario-card.unexpected { border-left-color: #a78bfa; border-color: rgba(167,139,250,0.2); background: rgba(167,139,250,0.04); }
+
+/* ══════════════════════════════════════════════
+   量子バッジ
+══════════════════════════════════════════════ */
+.quantum-badge {
+    display: inline-block;
+    padding: 0.22rem 0.65rem;
+    border-radius: 20px;
+    font-size: 0.68rem;
+    font-weight: 700;
+    margin: 0.12rem;
+    letter-spacing: 0.3px;
+    backdrop-filter: blur(4px);
+}
+.badge-required  { background: rgba(167,139,250,0.15); color: #a78bfa; border: 1px solid rgba(167,139,250,0.35); }
+.badge-optional  { background: rgba(245,158,11,0.12); color: #fbbf24; border: 1px solid rgba(245,158,11,0.3); }
+.badge-classical { background: rgba(16,185,129,0.12); color: #34d399; border: 1px solid rgba(16,185,129,0.3); }
+
+/* ══════════════════════════════════════════════
+   P&Lバー
+══════════════════════════════════════════════ */
+.pnl-bar-pos {
+    background: linear-gradient(90deg, #10b981, #34d399);
+    height: 6px; border-radius: 3px;
+    box-shadow: 0 0 8px rgba(16,185,129,0.4);
+}
+.pnl-bar-neg {
+    background: linear-gradient(90deg, #ef4444, #f87171);
+    height: 6px; border-radius: 3px;
+    box-shadow: 0 0 8px rgba(239,68,68,0.4);
+}
+
+/* ══════════════════════════════════════════════
+   アラートボックス（グラス）
+══════════════════════════════════════════════ */
+.alert-ok   { background: rgba(16,185,129,0.08); border-left: 3px solid #10b981; padding: 0.7rem 1rem; border-radius: 0 8px 8px 0; margin: 0.3rem 0; font-size: 0.83rem; color: #34d399; border: 1px solid rgba(16,185,129,0.2); border-left: 3px solid #10b981; }
+.alert-warn { background: rgba(245,158,11,0.08); border-left: 3px solid #f59e0b; padding: 0.7rem 1rem; border-radius: 0 8px 8px 0; margin: 0.3rem 0; font-size: 0.83rem; color: #fbbf24; border: 1px solid rgba(245,158,11,0.2); border-left: 3px solid #f59e0b; }
+.alert-err  { background: rgba(239,68,68,0.08);  border-left: 3px solid #ef4444; padding: 0.7rem 1rem; border-radius: 0 8px 8px 0; margin: 0.3rem 0; font-size: 0.83rem; color: #f87171; border: 1px solid rgba(239,68,68,0.2); border-left: 3px solid #ef4444; }
+.alert-info { background: rgba(167,139,250,0.08); border-left: 3px solid #a78bfa; padding: 0.7rem 1rem; border-radius: 0 8px 8px 0; margin: 0.3rem 0; font-size: 0.83rem; color: #c4b5fd; border: 1px solid rgba(167,139,250,0.2); border-left: 3px solid #a78bfa; }
+
+/* ══════════════════════════════════════════════
+   フローボックス（グラス）
+══════════════════════════════════════════════ */
+.flow-box {
+    background: rgba(255,255,255,0.03);
+    border: 1px solid rgba(255,255,255,0.08);
+    border-radius: 10px;
+    padding: 0.85rem 1.1rem;
+    margin: 0.3rem 0;
+    font-size: 0.83rem;
+    color: #ffffff;
+    backdrop-filter: blur(6px);
+    transition: border-color 0.2s;
+}
+.flow-box:hover { border-color: rgba(0,200,230,0.2); }
+.mono { font-family: 'JetBrains Mono', monospace; font-size: 0.80rem; color: #00c8e8; }
+
+/* ══════════════════════════════════════════════
+   想定外/通常タグ
+══════════════════════════════════════════════ */
+.unexpected-tag  { background: rgba(167,139,250,0.15); color: #a78bfa; border: 1px solid rgba(167,139,250,0.3); padding: 0.1rem 0.5rem; border-radius: 4px; font-size: 0.68rem; font-weight: 700; }
+.conventional-tag { background: rgba(16,185,129,0.12); color: #34d399; border: 1px solid rgba(16,185,129,0.3); padding: 0.1rem 0.5rem; border-radius: 4px; font-size: 0.68rem; font-weight: 700; }
+
+/* ══════════════════════════════════════════════
+   スクロールバー
+══════════════════════════════════════════════ */
+::-webkit-scrollbar { width: 6px; height: 6px; }
+::-webkit-scrollbar-track { background: rgba(255,255,255,0.02); }
+::-webkit-scrollbar-thumb { background: rgba(0,200,230,0.3); border-radius: 3px; }
+::-webkit-scrollbar-thumb:hover { background: rgba(0,200,230,0.5); }
+
+/* ══════════════════════════════════════════════
+   Plotly チャート背景統一
+══════════════════════════════════════════════ */
+.js-plotly-plot .plotly { background: transparent !important; }
+</style>
+""", unsafe_allow_html=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# Plotly ダークテーマ共通レイアウト
+# ══════════════════════════════════════════════════════════════════════════════
+_PLOTLY_BASE = dict(
+    paper_bgcolor="rgba(0,0,0,0)",
+    plot_bgcolor="rgba(5,13,26,0.6)",
+    font=dict(family="Inter, JetBrains Mono, sans-serif", color="#ffffff", size=11),
+    xaxis=dict(gridcolor="rgba(255,255,255,0.05)", zerolinecolor="rgba(0,200,230,0.2)",
+               linecolor="rgba(255,255,255,0.08)", tickfont=dict(size=10,color="#94a3b8")),
+    yaxis=dict(gridcolor="rgba(255,255,255,0.05)", zerolinecolor="rgba(0,200,230,0.2)",
+               linecolor="rgba(255,255,255,0.08)", tickfont=dict(size=10,color="#94a3b8")),
+    legend=dict(bgcolor="rgba(0,0,0,0)", bordercolor="rgba(255,255,255,0.1)",
+                borderwidth=1, font=dict(size=10,color="#94a3b8")),
+    margin=dict(t=36, b=28, l=28, r=12),
+    colorway=["#00c8e8","#7b2fbe","#f59e0b","#10b981","#ef4444","#38bdf8","#a78bfa","#34d399"],
 )
 
-''
-''
+def _dark_fig(fig, height=320, title=""):
+    """Plotly figにダークテーマレイアウトを適用"""
+    layout = dict(**_PLOTLY_BASE, height=height)
+    if title:
+        layout["title"] = dict(text=title, font=dict(size=13, color="#e2e8f0"), x=0.02, xanchor="left")
+    fig.update_layout(**layout)
+    return fig
+@st.cache_data
+def build_universe(n=100, seed=0):
+    rng = np.random.default_rng(seed)
+    codes   = [f"{7000+i:04d}" for i in range(n)]
+    names_  = [f"サンプル企業{i+1:03d}" for i in range(n)]
+    sectors = rng.choice(SECTORS, n)
+    price   = rng.integers(300, 12000, n)
+    ann_ret = rng.normal(0.055, 0.04, n)
+    ann_vol = rng.uniform(0.10, 0.38, n)
+    sharpe  = ann_ret / ann_vol
+    beta    = rng.uniform(0.4, 1.9, n)
+    mktcap  = rng.integers(500, 200000, n)
+    adv     = rng.integers(5, 8000, n)
 
+    # ════════════════════════════════════════════════════════════════
+    # 【A】株式系感応度（20ファクター対応）
+    # ════════════════════════════════════════════════════════════════
+    topix_beta   = rng.uniform(0.3, 1.8, n)
+    nk225_beta   = topix_beta * rng.uniform(0.9, 1.1, n)
+    small_beta   = rng.uniform(0.5, 2.2, n)
+    sp500_beta   = rng.uniform(0.2, 1.1, n)
+    asia_beta    = rng.uniform(0.2, 1.0, n)
+    eu_beta      = rng.uniform(0.1, 0.8, n)
+    cn_beta      = rng.uniform(0.1, 0.7, n)
+    gamma_coef   = rng.uniform(0.0, 0.05, n)
+    nk_gamma     = rng.uniform(0.0, 0.04, n)
+    # スタイルファクター
+    val_growth   = rng.uniform(-1.0, 1.0, n)   # +=バリュー, -=グロース
+    momentum     = rng.uniform(-0.5, 0.5, n)
+    size_factor  = rng.uniform(-0.5, 0.5, n)   # +=スモール
+    quality      = rng.uniform(-0.3, 0.3, n)
+    low_vol_f    = rng.uniform(-0.3, 0.3, n)
+    # セクター相対
+    sec_it_rel   = rng.uniform(-0.5, 0.5, n)
+    sec_fin_rel  = rng.uniform(-0.5, 0.5, n)
+    sec_re_rel   = rng.uniform(-0.5, 0.5, n)
+    sec_ene_rel  = rng.uniform(-0.4, 0.4, n)
+    div_sp       = rng.uniform(-0.2, 0.2, n)   # 高配当スプレッド感応度
+    cross_fx_eq  = rng.uniform(-0.1, 0.2, n)   # FX×株クロスΓ
 
-first_year = gdp_df[gdp_df['Year'] == from_year]
-last_year = gdp_df[gdp_df['Year'] == to_year]
+    # ════════════════════════════════════════════════════════════════
+    # 【B】ボラティリティ系（SABR 16ファクター対応）
+    # ════════════════════════════════════════════════════════════════
+    vix_sens     = rng.uniform(-0.25, 0.0, n)
+    vix_ts_sens  = rng.uniform(-0.15, 0.1, n)   # VIX期間構造
+    vvix_sens    = rng.uniform(-0.20, 0.0, n)   # VVIX
+    iv_atm_1m    = rng.uniform(-0.30, 0.0, n)
+    iv_atm_3m    = rng.uniform(-0.25, 0.0, n)
+    iv_atm_6m    = rng.uniform(-0.20, 0.0, n)
+    iv_atm_1y    = rng.uniform(-0.15, 0.0, n)
+    # SABRパラメータ感応度
+    sabr_alpha   = rng.uniform(-0.20, 0.0, n)   # α上昇→ベガ損失
+    sabr_beta    = rng.uniform(-0.05, 0.05, n)  # β：べき乗弾性
+    sabr_rho     = rng.uniform(-0.15, 0.05, n)  # ρ低下→左歪み増大
+    sabr_nu      = rng.uniform(-0.18, 0.0, n)   # ν上昇→ガンマコスト増
+    # ボラスキュー
+    skew_put     = rng.uniform(-0.20, 0.0, n)   # Putスキュー拡大→損失
+    skew_call    = rng.uniform(-0.05, 0.10, n)
+    kurtosis_s   = rng.uniform(-0.10, 0.0, n)
+    dispersion   = rng.uniform(-0.15, 0.05, n)
+    fwd_vol      = rng.uniform(-0.12, 0.0, n)
 
-st.header(f'GDP in {to_year}', divider='gray')
+    # ════════════════════════════════════════════════════════════════
+    # 【C】FX系（Vanna-Volga 20ファクター対応）
+    # ════════════════════════════════════════════════════════════════
+    fx_usd       = rng.uniform(-0.3, 0.8, n)
+    fx_eur       = rng.uniform(-0.2, 0.5, n)
+    fx_gbp       = rng.uniform(-0.15, 0.4, n)
+    fx_aud       = rng.uniform(-0.2, 0.4, n)
+    fx_cnh       = rng.uniform(-0.1, 0.3, n)
+    fx_eurusd    = rng.uniform(-0.1, 0.2, n)
+    fx_em        = rng.uniform(-0.2, 0.3, n)   # 新興国通貨
+    fx_iv_1m     = rng.uniform(-0.10, 0.0, n)  # USD/JPY ATM IV 1M
+    fx_iv_3m     = rng.uniform(-0.08, 0.0, n)
+    # Vanna-Volga: RR=リスクリバーサル, BF=バタフライ
+    vv_rr_1m     = rng.uniform(-0.12, 0.02, n)  # 25ΔRR 1M
+    vv_bf_1m     = rng.uniform(-0.08, 0.0, n)   # 25ΔBF 1M
+    vv_rr_3m     = rng.uniform(-0.10, 0.02, n)
+    vv_bf_3m     = rng.uniform(-0.06, 0.0, n)
+    eur_rr       = rng.uniform(-0.10, 0.02, n)
+    eur_bf       = rng.uniform(-0.06, 0.0, n)
+    # Vanna/Volga感応度
+    vanna_sens   = rng.uniform(-0.15, 0.0, n)   # ∂²V/∂S∂σ
+    volga_sens   = rng.uniform(-0.12, 0.0, n)   # ∂²V/∂σ²
+    fx_corr      = rng.uniform(-0.10, 0.10, n)  # USD/JPY-EUR/JPY相関
+    cross_fx_eq2 = cross_fx_eq.copy()           # クロスΓ（C群）
 
-''
+    # ════════════════════════════════════════════════════════════════
+    # 【D】金利・期間構造（18ファクター対応）
+    # ════════════════════════════════════════════════════════════════
+    rate_1m      = rng.uniform(-0.10, 0.10, n)
+    rate_3m      = rng.uniform(-0.12, 0.12, n)
+    rate_6m      = rng.uniform(-0.15, 0.15, n)
+    rate_1y      = rng.uniform(-0.20, 0.20, n)
+    rate_2y      = rng.uniform(-0.40, 0.30, n)
+    rate_5y      = rng.uniform(-0.50, 0.30, n)
+    rate_10y     = rng.uniform(-0.60, 0.30, n)
+    rate_20y     = rng.uniform(-0.65, 0.30, n)
+    rate_30y     = rng.uniform(-0.70, 0.30, n)
+    yc_2_10      = rng.uniform(-0.30, 0.30, n)  # スティープ(2Y-10Y)
+    yc_10_30     = rng.uniform(-0.25, 0.25, n)  # スティープ(10Y-30Y)
+    yc_butterfly = rng.uniform(-0.15, 0.15, n)  # バタフライ(2-5-10Y)
+    sw_1y1y      = rng.uniform(-0.10, 0.0, n)   # スワップション1Y1Y IV
+    sw_5y5y      = rng.uniform(-0.08, 0.0, n)   # スワップション5Y5Y IV
+    tonar_ois    = rng.uniform(-0.20, 0.10, n)  # TONAR-OISスプレッド
+    jp_us_spread = rng.uniform(-0.30, 0.30, n)  # 日米金利差
+    real_rate    = rng.uniform(-0.40, 0.30, n)  # 実質金利
+    cross_eq_rate= rng.uniform(-0.10, 0.10, n)  # クロスΓ(株×金利)
 
-cols = st.columns(4)
+    # ════════════════════════════════════════════════════════════════
+    # 【E】クレジット系（12ファクター対応）
+    # ════════════════════════════════════════════════════════════════
+    cds_ig_jp    = rng.uniform(-0.50, 0.0, n)
+    cds_hy_jp    = rng.uniform(-0.40, 0.0, n)
+    cdx_us_ig    = rng.uniform(-0.40, 0.0, n)
+    cdx_us_hy    = rng.uniform(-0.35, 0.0, n)
+    itraxx_eu    = rng.uniform(-0.30, 0.0, n)
+    cds_fin      = rng.uniform(-0.60, 0.0, n)   # 金融CDS
+    cds_re       = rng.uniform(-0.55, 0.0, n)   # 不動産CDS
+    sub_sen_sp   = rng.uniform(-0.30, 0.0, n)   # シニア-サブSP
+    def_corr     = rng.uniform(-0.20, 0.0, n)   # デフォルト相関
+    recovery     = rng.uniform(-0.10, 0.15, n)  # リカバリーレート
+    fallen_angel = rng.uniform(-0.25, 0.0, n)   # フォーリングエンジェル
+    credit_gamma = rng.uniform(-0.15, 0.0, n)   # クレジットΓ
 
-for i, country in enumerate(selected_countries):
-    col = cols[i % len(cols)]
+    # ════════════════════════════════════════════════════════════════
+    # 【F】コモディティ系（12ファクター対応）
+    # ════════════════════════════════════════════════════════════════
+    oil_1m       = rng.uniform(-0.30, 0.60, n)
+    oil_12m      = rng.uniform(-0.25, 0.50, n)
+    oil_ts       = rng.uniform(-0.10, 0.10, n)  # 原油期間構造
+    gas          = rng.uniform(-0.15, 0.40, n)
+    gold         = rng.uniform(-0.10, 0.30, n)
+    silver       = rng.uniform(-0.10, 0.25, n)
+    copper       = rng.uniform(-0.20, 0.40, n)
+    iron         = rng.uniform(-0.25, 0.40, n)
+    agri         = rng.uniform(-0.15, 0.20, n)
+    ovx          = rng.uniform(-0.15, 0.0, n)   # OVX（原油ボラ）
+    comm_corr    = rng.uniform(-0.10, 0.0, n)
+    cross_oil_fx = rng.uniform(-0.08, 0.08, n)  # クロスΓ(原油×FX)
 
-    with col:
-        first_gdp = first_year[first_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
-        last_gdp = last_year[last_year['Country Code'] == country]['GDP'].iat[0] / 1000000000
+    # ════════════════════════════════════════════════════════════════
+    # 【G】流動性・マクロ系（10ファクター対応）
+    # ════════════════════════════════════════════════════════════════
+    amihud       = rng.uniform(-0.20, 0.0, n)   # Amihud流動性指数
+    bid_ask_eq   = rng.uniform(-0.15, 0.0, n)   # 株式BA
+    bond_liq     = rng.uniform(-0.12, 0.0, n)   # 社債流動性
+    boj_bs       = rng.uniform(-0.05, 0.05, n)  # 日銀BS
+    gdp_growth   = rng.uniform(-0.10, 0.20, n)
+    cpi          = rng.uniform(-0.15, 0.10, n)
+    pmi          = rng.uniform(-0.10, 0.15, n)
+    put_call     = rng.uniform(-0.10, 0.0, n)   # Put/Call比
+    systemic     = rng.uniform(-0.20, 0.0, n)   # システミックリスク
+    cross_liq_eq = rng.uniform(-0.10, 0.0, n)   # クロスΓ(流動性×株)
 
-        if math.isnan(first_gdp):
-            growth = 'n/a'
-            delta_color = 'off'
+    # ════════════════════════════════════════════════════════════════
+    # DataFrame 組み立て（全グループ列を包含）
+    # ════════════════════════════════════════════════════════════════
+    return pd.DataFrame({
+        # ── 基本情報 ──
+        "コード": codes, "銘柄名": names_, "セクター": sectors,
+        "株価（円）": price,
+        "期待リターン（年率）":   ann_ret.round(4),
+        "ボラティリティ（年率）": ann_vol.round(4),
+        "シャープレシオ":         sharpe.round(3),
+        "ベータ":                 beta.round(2),
+        "時価総額（億円）":       mktcap,
+        "平均出来高（百万円/日）": adv,
+        # ── 【A】株式系 ──
+        "TOPIX感応度":            topix_beta.round(3),
+        "日経225感応度":          nk225_beta.round(3),
+        "小型株感応度":           small_beta.round(3),
+        "S&P500感応度":           sp500_beta.round(3),
+        "アジア株感応度":         asia_beta.round(3),
+        "欧州株感応度":           eu_beta.round(3),
+        "中国株感応度":           cn_beta.round(3),
+        "ガンマ係数":             gamma_coef.round(4),
+        "NK225ガンマ係数":        nk_gamma.round(4),
+        "バリュー/グロース感応度": val_growth.round(3),
+        "モメンタム感応度":       momentum.round(3),
+        "サイズファクター感応度": size_factor.round(3),
+        "クオリティ感応度":       quality.round(3),
+        "ローボラファクター感応度":low_vol_f.round(3),
+        "IT相対感応度":           sec_it_rel.round(3),
+        "金融相対感応度":         sec_fin_rel.round(3),
+        "不動産相対感応度":       sec_re_rel.round(3),
+        "エネルギー相対感応度":   sec_ene_rel.round(3),
+        "高配当スプレッド感応度": div_sp.round(3),
+        "クロスΓ(FX×株)":        cross_fx_eq.round(4),
+        # ── 【B】SABR/ボラ系 ──
+        "VIX感応度":              vix_sens.round(3),
+        "VIX期間構造感応度":      vix_ts_sens.round(3),
+        "VVIX感応度":             vvix_sens.round(3),
+        "日本株IV_ATM_1M感応度":  iv_atm_1m.round(3),
+        "日本株IV_ATM_3M感応度":  iv_atm_3m.round(3),
+        "日本株IV_ATM_6M感応度":  iv_atm_6m.round(3),
+        "日本株IV_ATM_1Y感応度":  iv_atm_1y.round(3),
+        "SABR_α感応度":          sabr_alpha.round(3),
+        "SABR_β感応度":          sabr_beta.round(4),
+        "SABR_ρ感応度":          sabr_rho.round(3),
+        "SABR_ν感応度":          sabr_nu.round(3),
+        "ボラスキュー_Put感応度": skew_put.round(3),
+        "ボラスキュー_Call感応度":skew_call.round(3),
+        "ボラカートシス感応度":   kurtosis_s.round(3),
+        "ディスパーション感応度": dispersion.round(3),
+        "フォワードボラ感応度":   fwd_vol.round(3),
+        # ── 【C】FX/Vanna-Volga系 ──
+        "FX感応度(USD)":          fx_usd.round(3),
+        "FX感応度(EUR)":          fx_eur.round(3),
+        "FX感応度(GBP)":          fx_gbp.round(3),
+        "FX感応度(AUD)":          fx_aud.round(3),
+        "FX感応度(CNH)":          fx_cnh.round(3),
+        "FX感応度(EURUSD)":       fx_eurusd.round(3),
+        "新興国通貨感応度":        fx_em.round(3),
+        "USDJPY_IV_1M感応度":     fx_iv_1m.round(3),
+        "USDJPY_IV_3M感応度":     fx_iv_3m.round(3),
+        "VV_RR_1M感応度":         vv_rr_1m.round(3),
+        "VV_BF_1M感応度":         vv_bf_1m.round(3),
+        "VV_RR_3M感応度":         vv_rr_3m.round(3),
+        "VV_BF_3M感応度":         vv_bf_3m.round(3),
+        "EUR_RR感応度":           eur_rr.round(3),
+        "EUR_BF感応度":           eur_bf.round(3),
+        "Vanna感応度":            vanna_sens.round(3),
+        "Volga感応度":            volga_sens.round(3),
+        "FX相関感応度":           fx_corr.round(3),
+        "クロスΓ2(FX×株)":       cross_fx_eq2.round(4),
+        # ── 【D】金利期間構造系 ──
+        "金利感応度(1M)":         rate_1m.round(3),
+        "金利感応度(3M)":         rate_3m.round(3),
+        "金利感応度(6M)":         rate_6m.round(3),
+        "金利感応度(1Y)":         rate_1y.round(3),
+        "金利感応度(2Y)":         rate_2y.round(3),
+        "金利感応度(5Y)":         rate_5y.round(3),
+        "金利感応度(10Y)":        rate_10y.round(3),
+        "金利感応度(20Y)":        rate_20y.round(3),
+        "金利感応度(30Y)":        rate_30y.round(3),
+        "YC_スティープ(2Y-10Y)感応度":  yc_2_10.round(3),
+        "YC_スティープ(10Y-30Y)感応度": yc_10_30.round(3),
+        "YC_バタフライ感応度":    yc_butterfly.round(3),
+        "スワップション1Y1Y感応度":sw_1y1y.round(3),
+        "スワップション5Y5Y感応度":sw_5y5y.round(3),
+        "TONAR_OIS感応度":        tonar_ois.round(3),
+        "日米金利差感応度":        jp_us_spread.round(3),
+        "実質金利感応度":          real_rate.round(3),
+        "クロスΓ(株×金利)":       cross_eq_rate.round(4),
+        # ── 【E】クレジット系 ──
+        "CDS_IG(日本)感応度":     cds_ig_jp.round(3),
+        "CDS_HY(日本)感応度":     cds_hy_jp.round(3),
+        "CDX_IG(米国)感応度":     cdx_us_ig.round(3),
+        "CDX_HY(米国)感応度":     cdx_us_hy.round(3),
+        "iTraxx(欧州)感応度":     itraxx_eu.round(3),
+        "金融CDS感応度":          cds_fin.round(3),
+        "不動産CDS感応度":        cds_re.round(3),
+        "シニア_サブSP感応度":    sub_sen_sp.round(3),
+        "デフォルト相関感応度":   def_corr.round(3),
+        "リカバリーレート感応度": recovery.round(3),
+        "フォーリングエンジェル感応度": fallen_angel.round(3),
+        "クレジットΓ感応度":      credit_gamma.round(3),
+        # ── 【F】コモディティ系 ──
+        "原油(1M)感応度":         oil_1m.round(3),
+        "原油(12M)感応度":        oil_12m.round(3),
+        "原油期間構造感応度":     oil_ts.round(3),
+        "天然ガス感応度":         gas.round(3),
+        "金感応度":               gold.round(3),
+        "銀感応度":               silver.round(3),
+        "銅感応度":               copper.round(3),
+        "鉄鉱石感応度":           iron.round(3),
+        "農産物感応度":           agri.round(3),
+        "OVX感応度":              ovx.round(3),
+        "コモディティ相関感応度": comm_corr.round(3),
+        "クロスΓ(原油×FX)":      cross_oil_fx.round(4),
+        # ── 【G】流動性・マクロ系 ──
+        "Amihud流動性感応度":     amihud.round(3),
+        "株式BA感応度":           bid_ask_eq.round(3),
+        "社債流動性感応度":       bond_liq.round(3),
+        "日銀BS感応度":           boj_bs.round(3),
+        "GDP成長率感応度":        gdp_growth.round(3),
+        "CPI感応度":              cpi.round(3),
+        "PMI感応度":              pmi.round(3),
+        "Put_Call比感応度":       put_call.round(3),
+        "システミックリスク感応度":systemic.round(3),
+        "クロスΓ(流動性×株)":    cross_liq_eq.round(4),
+        # ── 後方互換エイリアス ──
+        "FX感応度":               fx_usd.round(3),
+        "金利感応度":             rate_10y.round(3),
+        "クレジット感応度":       cds_ig_jp.round(3),
+        "HY感応度":               cds_hy_jp.round(3),
+        "原油感応度":             oil_1m.round(3),
+        "YCスティープ感応度":     yc_2_10.round(3),
+        "日本株IV感応度":         iv_atm_1m.round(3),
+    })
+
+@st.cache_data
+def build_returns(n_stocks, n_days=1260, seed=0):
+    rng = np.random.default_rng(seed)
+    n_factors = 5
+    factor_ret = rng.normal(0, 0.008, (n_days, n_factors))
+    loadings   = rng.uniform(0.2, 0.7, (n_stocks, n_factors))
+    idio       = rng.normal(0, 0.007, (n_days, n_stocks))
+    return factor_ret @ loadings.T + idio
+
+# ══════════════════════════════════════════════════════════════════════════════
+# リスク計算ユーティリティ
+# ══════════════════════════════════════════════════════════════════════════════
+def portfolio_var_hist(w, ret_mat, conf=0.99):
+    pr = ret_mat @ w
+    return float(-np.percentile(pr, (1-conf)*100))
+
+def portfolio_cvar_hist(w, ret_mat, conf=0.99):
+    pr = ret_mat @ w
+    threshold = np.percentile(pr, (1-conf)*100)
+    tail = pr[pr <= threshold]
+    return float(-tail.mean()) if len(tail) > 0 else 0.0
+
+def portfolio_vol(w, cov):
+    return float(np.sqrt(w @ cov @ w * 252))
+
+def tracking_error(w, bw, cov):
+    d = w - bw
+    return float(np.sqrt(d @ cov @ d * 252))
+
+def hhi(w):
+    return float(np.sum(w**2))
+
+# ══════════════════════════════════════════════════════════════════════════════
+# RST計算エンジン
+# ══════════════════════════════════════════════════════════════════════════════
+def calc_rst_pnl(levels_idx, w, df_sel, aum):
+    """
+    108ファクターに対するポートフォリオPnL（百万円）
+    カテゴリ別にデルタ/ガンマ/ベガ/クロスΓを計算。
+    PnL ≈ Σ(Δ寄与) + Σ(Γ寄与) + Σ(クロスΓ寄与)
+    """
+    n = len(df_sel)
+    # moves[j] = j番目ファクターの変化量（実数）
+    moves = np.array([RST_FACTORS[j]["levels"][int(levels_idx[j])]
+                      for j in range(N_RST_FACTORS)], dtype=float)
+    cats  = [RST_FACTORS[j]["category"] for j in range(N_RST_FACTORS)]
+    names = [RST_FACTORS[j]["name"]     for j in range(N_RST_FACTORS)]
+
+    # ── ポートフォリオ加重平均感応度 ────────────────────────────────────────
+    def wsum(col, default=0.0):
+        if col in df_sel.columns:
+            return float(np.dot(w, df_sel[col].fillna(default).values))
+        return default
+
+    topix_s   = wsum("TOPIX感応度",    1.0)
+    nk225_s   = wsum("日経225感応度",  topix_s * 1.05)
+    small_s   = wsum("小型株感応度",   1.2)
+    sp500_s   = wsum("S&P500感応度",   0.5)
+    gamma_s   = wsum("ガンマ係数",     0.02)
+    vix_s     = wsum("VIX感応度",     -0.1)
+    iv_s      = wsum("日本株IV感応度",-0.15)
+    fx_usd_s  = wsum("FX感応度(USD)", wsum("FX感応度", 0.0))
+    fx_eur_s  = wsum("FX感応度(EUR)", fx_usd_s * 0.6)
+    rate2y_s  = wsum("金利感応度(2Y)", wsum("金利感応度", 0.0) * 0.7)
+    rate10y_s = wsum("金利感応度(10Y)",wsum("金利感応度", 0.0))
+    yc_s      = wsum("YCスティープ感応度", 0.0)
+    cg_fxeq_s = wsum("クロスΓ(FX×株)", 0.05)
+    cg_eqr_s  = wsum("クロスΓ(株×金利)",0.03)
+    credit_s  = wsum("クレジット感応度",-0.3)
+    hy_s      = wsum("HY感応度",       -0.2)
+    oil_s     = wsum("原油感応度",      0.0)
+    gold_s    = wsum("金感応度",        0.0)
+    avg_vol   = float(np.dot(w, df_sel["ボラティリティ（年率）"].fillna(0.2).values))
+
+    # セクター別ウェイト
+    def sec_w(sec_list):
+        return sum(w[i] for i in range(n) if df_sel.iloc[i]["セクター"] in sec_list)
+
+    w_fin  = sec_w(["金融"])
+    w_re   = sec_w(["不動産"])
+    w_ene  = sec_w(["エネルギー"])
+    w_con  = sec_w(["消費財"])
+    w_it   = sec_w(["情報技術"])
+
+    # TOPIX・10Y 変化量を先取り（クロスΓで使う）
+    m_topix  = moves[_fi("TOPIX変化率")]         if _fi("TOPIX変化率")>=0 else 0.0
+    m_usdjpy = moves[_fi("USD/JPY変化率")]        if _fi("USD/JPY変化率")>=0 else 0.0
+    m_10y    = moves[_fi("10Y JGB金利変化")]      if _fi("10Y JGB金利変化")>=0 else 0.0
+
+    pnl_total = 0.0
+    pnl_by_factor = []
+
+    for j in range(N_RST_FACTORS):
+        mv   = moves[j]
+        cat  = cats[j]
+        nm   = names[j]
+        pnl_j = 0.0
+
+        # ── A. 株式系 ─────────────────────────────────────────────────────
+        if cat == "株式Δ":
+            if "TOPIX" in nm and "小型" not in nm and "急落" not in nm:
+                pnl_j = topix_s * (mv/100) * aum / 1e6
+            elif "日経225" in nm:
+                pnl_j = nk225_s * (mv/100) * aum / 1e6
+            elif "小型" in nm:
+                pnl_j = small_s * (mv/100) * aum / 1e6
+            elif "S&P500" in nm:
+                pnl_j = sp500_s * (mv/100) * aum / 1e6
+            elif "MSCI" in nm or "STOXX" in nm or "CSI" in nm:
+                pnl_j = sp500_s * 0.7 * (mv/100) * aum / 1e6
+            else:
+                pnl_j = topix_s * 0.5 * (mv/100) * aum / 1e6
+
+        elif cat == "株式Γ":
+            # Γ項: ½ γ (ΔTOPIX)² × 非線形係数
+            pnl_j = -0.5 * abs(gamma_s) * (m_topix/100)**2 * aum / 1e6 * abs(mv)
+
+        elif cat == "スタイル":
+            # スタイルファクター：ポートフォリオのスタイルバイアス（簡易）
+            style_bias = wsum("ガンマ係数", 0.01) * 5  # 代理変数
+            pnl_j = style_bias * (mv/100) * aum * 0.3 / 1e6
+
+        elif cat == "セクターΔ":
+            if "情報技術" in nm:
+                pnl_j = w_it * (mv/100) * aum / 1e6
+            elif "金融" in nm:
+                pnl_j = w_fin * (mv/100) * aum / 1e6
+            elif "不動産" in nm:
+                pnl_j = w_re * (mv/100) * aum / 1e6
+            elif "エネルギー" in nm:
+                pnl_j = w_ene * (mv/100) * aum / 1e6
+            else:
+                pnl_j = (mv/100) * aum * 0.05 / 1e6
+
+        # ── B. ボラティリティ系（SABR含む）──────────────────────────────────
+        elif cat == "VIX系":
+            if "VVIX" in nm:
+                pnl_j = -abs(vix_s) * (mv/100) * aum * 0.15 / 1e6
+            elif "期間構造" in nm:
+                # VIX期間構造逆転はショートガンマ戦略にとってリスク
+                pnl_j = -abs(vix_s) * (mv/100) * aum * 0.10 / 1e6
+            else:
+                pnl_j = vix_s * (mv/100) * aum * 0.3 / 1e6 \
+                        - avg_vol * (mv/100) * aum * 0.2 / 1e6
+
+        elif cat == "VolSurf":
+            pnl_j = iv_s * (mv/100) * aum * 0.25 / 1e6
+
+        elif cat == "SABR":
+            # SABR α: ボラ水準上昇 → ショートベガに損失
+            # SABR ρ: ρ低下（負値増大）→ 左歪みが強まる → Put側損失
+            # SABR ν: ν上昇 → ガンマコスト増大 → 損失
+            if "α" in nm:
+                pnl_j = iv_s * (mv/100) * aum * 0.30 / 1e6
+            elif "ρ" in nm:
+                pnl_j = -abs(gamma_s) * (mv/100) * aum * 0.20 / 1e6
+            elif "ν" in nm:
+                pnl_j = -abs(gamma_s) * (mv/100) * aum * 0.25 / 1e6
+            elif "β" in nm:
+                pnl_j = iv_s * 0.5 * (mv/100) * aum * 0.10 / 1e6
+            else:
+                pnl_j = 0.0
+
+        elif cat == "VolSkew":
+            # ボラスキュー変化: Put側スキュー拡大 → プット保護コスト増
+            if "Put" in nm:
+                pnl_j = -abs(iv_s) * (mv/100) * aum * 0.20 / 1e6
+            elif "Call" in nm:
+                pnl_j = abs(iv_s) * (mv/100) * aum * 0.10 / 1e6
+            elif "カートシス" in nm:
+                pnl_j = -abs(gamma_s) * (mv/100) * aum * 0.15 / 1e6
+            else:
+                pnl_j = iv_s * (mv/100) * aum * 0.10 / 1e6
+
+        # ── C. FX系（Vanna-Volga含む）───────────────────────────────────────
+        elif cat == "FXΔ":
+            if "USD/JPY" in nm:
+                pnl_j = fx_usd_s * (mv/100) * aum / 1e6
+            elif "EUR/JPY" in nm or "EUR" in nm:
+                pnl_j = fx_eur_s * (mv/100) * aum / 1e6
+            elif "GBP" in nm:
+                pnl_j = fx_eur_s * 0.8 * (mv/100) * aum / 1e6
+            elif "AUD" in nm:
+                pnl_j = (oil_s * 0.3 + fx_usd_s * 0.4) * (mv/100) * aum / 1e6
+            elif "CNH" in nm or "新興国" in nm:
+                pnl_j = fx_usd_s * 0.3 * (mv/100) * aum / 1e6
+            else:
+                pnl_j = fx_usd_s * 0.5 * (mv/100) * aum / 1e6
+
+        elif cat == "FX VolSurf":
+            pnl_j = abs(iv_s) * (mv/100) * aum * 0.15 / 1e6
+
+        elif cat == "VannaVolga":
+            # VV: PnL ≈ x₁·Vanna·RR + x₂·Volga·BF
+            # RR（リスクリバーサル）が拡大 → 外国人の円プット需要増 → コスト増
+            # BF（バタフライ）が拡大 → 両テールのIV上昇 → ヘッジコスト増
+            if "RR" in nm:
+                # RR拡大 = 円安リスクプレミアム上昇 → 外貨資産保有者は円コストが増
+                pnl_j = -abs(fx_usd_s) * abs(cg_fxeq_s) * (mv/100) * aum * 0.15 / 1e6
+            elif "BF" in nm:
+                # BF拡大 = テールリスクプレミアム上昇
+                pnl_j = -abs(gamma_s) * (mv/100) * aum * 0.10 / 1e6
+            elif "Vanna" in nm:
+                # Vanna = ∂²V/∂S∂σ : FX移動とIV変化の交差感応度
+                pnl_j = -abs(fx_usd_s) * abs(iv_s) * (mv/100) * aum * 0.20 / 1e6
+            elif "Volga" in nm:
+                # Volga = ∂²V/∂σ² : IVに対する凸性
+                pnl_j = -abs(gamma_s) * (mv/100) * aum * 0.18 / 1e6
+            else:
+                pnl_j = 0.0
+
+        elif cat == "FX相関":
+            # FX通貨ペア間の相関変化: 分散効果に影響
+            pnl_j = -abs(fx_usd_s) * (mv/100) * aum * 0.10 / 1e6
+
+        # ── D. 金利・期間構造 ─────────────────────────────────────────────────
+        elif cat == "金利期間構造":
+            # テナー別感応度（10Yを基準に逓減）
+            tenor_weights = {
+                "1M": 0.05, "3M": 0.1, "6M": 0.2, "1Y": 0.4,
+                "2Y": 0.6,  "5Y": 0.8, "10Y": 1.0, "20Y": 1.3, "30Y": 1.5,
+            }
+            tw = 1.0
+            for t, w_t in tenor_weights.items():
+                if t + " " in nm or nm.endswith(t):
+                    tw = w_t; break
+            pnl_j = rate10y_s * tw * (mv/100) * aum / 1e6
+
+        elif cat == "カーブ形状":
+            pnl_j = yc_s * (mv/100) * aum / 1e6
+
+        elif cat == "金利ボラ":
+            # スワップションIV上昇: 金利ヘッジコスト増
+            pnl_j = -abs(rate10y_s) * (mv/100) * aum * 0.15 / 1e6
+
+        elif cat == "金利スプレッド":
+            if "日米金利差" in nm:
+                pnl_j = (fx_usd_s + rate10y_s * 0.5) * (mv/100) * aum * 0.3 / 1e6
+            elif "実質金利" in nm:
+                pnl_j = rate10y_s * (mv/100) * aum * 0.8 / 1e6
+            elif "TONAR" in nm:
+                pnl_j = -(w_fin * 0.3 + abs(credit_s) * 0.2) * (mv/100) * aum / 1e6
+            else:
+                pnl_j = rate10y_s * 0.5 * (mv/100) * aum / 1e6
+
+        # ── E. クレジット系 ───────────────────────────────────────────────────
+        elif cat == "クレジット":
+            if "金融" in nm:
+                pnl_j = -w_fin * (mv/100) * aum * 0.8 / 1e6 \
+                        + credit_s * (mv/100) * aum * 0.3 / 1e6
+            elif "不動産" in nm:
+                pnl_j = -w_re * (mv/100) * aum * 0.7 / 1e6
+            elif "HY" in nm or "ハイイールド" in nm:
+                pnl_j = hy_s * (mv/100) * aum * 0.5 / 1e6
+            elif "デフォルト相関" in nm:
+                # 相関上昇 → CDO/CLOトランシェが非線形に損失
+                pnl_j = -abs(credit_s) * (mv/100) * aum * 0.30 / 1e6
+            elif "リカバリー" in nm:
+                pnl_j = abs(credit_s) * (mv/100) * aum * 0.15 / 1e6
+            elif "フォーリングエンジェル" in nm or "BBB" in nm:
+                pnl_j = -(abs(credit_s) + abs(hy_s)) * (mv/100) * aum * 0.25 / 1e6
+            elif "シニア-サブ" in nm:
+                pnl_j = -(w_fin + w_re) * (mv/100) * aum * 0.4 / 1e6
+            else:
+                pnl_j = credit_s * (mv/100) * aum * 0.4 / 1e6
+
+        # ── F. コモディティ系 ─────────────────────────────────────────────────
+        elif cat == "エネルギー":
+            if "期間構造" in nm:
+                pnl_j = oil_s * (mv/100) * aum * 0.2 / 1e6
+            else:
+                pnl_j = (w_ene * 0.6 - w_con * 0.3) * (mv/100) * aum / 1e6 \
+                        + oil_s * (mv/100) * aum * 0.3 / 1e6
+
+        elif cat == "貴金属":
+            if "金" in nm:
+                pnl_j = gold_s * (mv/100) * aum / 1e6
+            else:
+                pnl_j = gold_s * 0.7 * (mv/100) * aum / 1e6
+
+        elif cat == "産業金属":
+            # 銅・鉄鉱石 ↑ → 製造業コスト ↑ → 消費財・資本財に逆風
+            pnl_j = -w_con * 0.3 * (mv/100) * aum / 1e6 \
+                    + oil_s * 0.3 * (mv/100) * aum / 1e6
+
+        elif cat == "農産物":
+            pnl_j = -w_con * 0.2 * (mv/100) * aum / 1e6
+
+        elif cat == "コモボラ":
+            if "OVX" in nm:
+                pnl_j = -oil_s * (mv/100) * aum * 0.2 / 1e6
+            else:
+                pnl_j = -abs(oil_s) * (mv/100) * aum * 0.1 / 1e6
+
+        # ── G. 流動性・マクロ系 ─────────────────────────────────────────────
+        elif cat == "流動性":
+            # Amihud流動性指数悪化 → スリッページ拡大 → 実損失増加
+            pnl_j = -topix_s * abs(mv/100) * aum * 0.25 / 1e6
+
+        elif cat == "マクロ":
+            if "GDP" in nm:
+                pnl_j = topix_s * (mv/100) * aum * 0.5 / 1e6
+            elif "CPI" in nm:
+                pnl_j = -(w_con + abs(rate10y_s * 0.3)) * (mv/100) * aum / 1e6
+            elif "PMI" in nm:
+                pnl_j = topix_s * 0.4 * (mv/100) * aum / 1e6
+            else:
+                pnl_j = 0.0
+
+        elif cat == "センチ":
+            if "Put/Call" in nm:
+                # P/C比上昇 → 市場が弱気 → 株安
+                pnl_j = -topix_s * abs(mv/100) * aum * 0.2 / 1e6
+            elif "システミック" in nm:
+                pnl_j = -(topix_s + abs(credit_s)) * (mv/100) * aum * 0.3 / 1e6
+
+        # ── クロスガンマ項（非線形交叉） ────────────────────────────────────
+        elif cat == "クロスΓ":
+            if "FX" in nm and "株" in nm:
+                pnl_j = cg_fxeq_s * (m_topix/100) * (m_usdjpy/100) * aum / 1e6 * abs(mv)
+            elif "株" in nm and "金利" in nm:
+                pnl_j = -cg_eqr_s * abs(m_topix/100) * abs(m_10y/100) * aum / 1e6 * abs(mv)
+            elif "流動性" in nm and "株" in nm:
+                pnl_j = -topix_s * abs(gamma_s) * (mv/100) * aum * 0.3 / 1e6
+            elif "原油" in nm and "FX" in nm:
+                pnl_j = -(oil_s * fx_usd_s) * (mv/100) * aum * 0.2 / 1e6
+            elif "クレジット" in nm:
+                pnl_j = -abs(credit_s) * abs(m_topix/100) * aum * 0.15 / 1e6 * abs(mv)
+            else:
+                pnl_j = -abs(gamma_s) * (mv/100) * aum * 0.1 / 1e6
+
+        pnl_total += pnl_j
+        pnl_by_factor.append({
+            "ファクター": nm, "変化量": mv,
+            "単位":       RST_FACTORS[j]["unit"],
+            "カテゴリ":   cat,
+            "グループ":   RST_FACTORS[j].get("group", "?"),
+            "PnL（百万円）": pnl_j,
+        })
+
+    return pnl_total, pnl_by_factor
+    pnl_total = 0.0
+    pnl_by_factor = []
+
+    # ── セクターファクター感応度マトリクス ────────────────────────────────
+    sector_topix_mult = {
+        "情報技術": 1.3, "金融": 0.9, "ヘルスケア": 0.7, "消費財": 0.8, "資本財": 1.1,
+        "エネルギー": 0.6, "素材": 1.0, "通信": 0.6, "公益事業": 0.5, "不動産": 1.2,
+    }
+    sector_fx_mult = {
+        "情報技術": 0.4, "金融": -0.1, "ヘルスケア": 0.2, "消費財": -0.2, "資本財": 0.5,
+        "エネルギー": 0.1, "素材": 0.3, "通信": -0.1, "公益事業": -0.2, "不動産": -0.3,
+    }
+    sector_rate_mult = {
+        "情報技術": -0.4, "金融": 0.5, "ヘルスケア": -0.1, "消費財": -0.1, "資本財": -0.2,
+        "エネルギー": 0.0, "素材": -0.1, "通信": -0.2, "公益事業": -0.5, "不動産": -0.6,
+    }
+    sector_hy_mult = {
+        "情報技術": -0.2, "金融": -0.6, "ヘルスケア": -0.1, "消費財": -0.2, "資本財": -0.3,
+        "エネルギー": -0.4, "素材": -0.2, "通信": -0.3, "公益事業": -0.4, "不動産": -0.7,
+    }
+
+    # 各ファクターの変化量（実数）を先に取り出す
+    moves = [RST_FACTORS[j]["levels"][int(levels_idx[j])] for j in range(N_RST_FACTORS)]
+    factor_names = [RST_FACTORS[j]["name"] for j in range(N_RST_FACTORS)]
+
+    # ── ファクター別PnL計算 ────────────────────────────────────────────────
+    for j, fac in enumerate(RST_FACTORS):
+        move = moves[j]
+        name = fac["name"]
+        cat  = fac.get("category", "")
+
+        if name == "TOPIX変化率":
+            sens = sum(
+                w[i] * df_sel.iloc[i]["TOPIX感応度"] *
+                sector_topix_mult.get(df_sel.iloc[i]["セクター"], 1.0)
+                for i in range(len(df_sel)))
+            pnl_j = sens * (move / 100) * aum / 1e6
+
+        elif name == "日経225変化率":
+            sens = sum(
+                w[i] * df_sel.iloc[i].get("日経225感応度", df_sel.iloc[i]["TOPIX感応度"] * 1.05) *
+                sector_topix_mult.get(df_sel.iloc[i]["セクター"], 1.0)
+                for i in range(len(df_sel)))
+            pnl_j = sens * (move / 100) * aum / 1e6
+
+        elif name == "TOPIX小型株変化率":
+            # 小型株ウェイトは時価総額の小さい銘柄ほど感応度高い
+            sens = sum(
+                w[i] * df_sel.iloc[i].get("小型株感応度", 1.2) *
+                sector_topix_mult.get(df_sel.iloc[i]["セクター"], 1.0) * 0.8
+                for i in range(len(df_sel)))
+            pnl_j = sens * (move / 100) * aum / 1e6
+
+        elif name == "米国株(S&P500)連動変化率":
+            sens = sum(
+                w[i] * df_sel.iloc[i].get("S&P500感応度", 0.5)
+                for i in range(len(df_sel)))
+            pnl_j = sens * (move / 100) * aum / 1e6
+
+        elif name == "TOPIX急落加速【ガンマ】":
+            # ガンマ項：PnL ≈ ½ × Σᵢ wᵢ×γᵢ × (TOPIX変化)²
+            topix_move = moves[factor_names.index("TOPIX変化率")]
+            gamma_sens = sum(w[i] * df_sel.iloc[i].get("ガンマ係数", 0.02)
+                             for i in range(len(df_sel)))
+            pnl_j = -0.5 * gamma_sens * (topix_move / 100)**2 * aum / 1e6 * abs(move)
+
+        elif name == "VIX変化":
+            avg_vol = df_sel["ボラティリティ（年率）"].values @ w
+            vix_sens_port = sum(w[i] * abs(df_sel.iloc[i].get("VIX感応度", -0.1))
+                                for i in range(len(df_sel)))
+            pnl_j = -vix_sens_port * (move / 100) * aum * 0.3 / 1e6 - avg_vol * (move/100)*aum*0.2/1e6
+
+        elif name == "日本株IV変化【ベガ】":
+            iv_sens_port = sum(w[i] * abs(df_sel.iloc[i].get("日本株IV感応度", -0.15))
+                               for i in range(len(df_sel)))
+            pnl_j = -iv_sens_port * (move / 100) * aum * 0.25 / 1e6
+
+        elif name == "USD/JPY変化率":
+            sens = sum(
+                w[i] * df_sel.iloc[i].get("FX感応度(USD)", df_sel.iloc[i]["FX感応度"]) *
+                sector_fx_mult.get(df_sel.iloc[i]["セクター"], 0.0)
+                for i in range(len(df_sel)))
+            pnl_j = sens * (move / 100) * aum / 1e6
+
+        elif name == "EUR/JPY変化率":
+            sens = sum(
+                w[i] * df_sel.iloc[i].get("FX感応度(EUR)", df_sel.iloc[i]["FX感応度"] * 0.6) *
+                sector_fx_mult.get(df_sel.iloc[i]["セクター"], 0.0)
+                for i in range(len(df_sel)))
+            pnl_j = sens * (move / 100) * aum / 1e6
+
+        elif name == "USD/JPY×株式クロスΓ":
+            # クロスガンマ項: PnL ≈ Σᵢ wᵢ×Γ_FX_EQ × Δ_TOPIX × Δ_USDJPY
+            topix_move = moves[factor_names.index("TOPIX変化率")]
+            usdjpy_move = moves[factor_names.index("USD/JPY変化率")]
+            cg_sens = sum(w[i] * df_sel.iloc[i].get("クロスΓ(FX×株)", 0.05)
+                          for i in range(len(df_sel)))
+            pnl_j = cg_sens * (topix_move / 100) * (usdjpy_move / 100) * aum / 1e6 * abs(move)
+
+        elif name == "短期金利変化(2Y JGB)":
+            sens = sum(
+                w[i] * df_sel.iloc[i].get("金利感応度(2Y)", df_sel.iloc[i]["金利感応度"] * 0.7) *
+                sector_rate_mult.get(df_sel.iloc[i]["セクター"], 0.0)
+                for i in range(len(df_sel)))
+            pnl_j = sens * (move / 100) * aum / 1e6
+
+        elif name == "長期金利変化(10Y JGB)":
+            sens = sum(
+                w[i] * df_sel.iloc[i].get("金利感応度(10Y)", df_sel.iloc[i]["金利感応度"]) *
+                sector_rate_mult.get(df_sel.iloc[i]["セクター"], 0.0)
+                for i in range(len(df_sel)))
+            pnl_j = sens * (move / 100) * aum / 1e6
+
+        elif name == "イールドカーブスティープ変化":
+            # イールドカーブスティープニングは銀行に有利、不動産・公益に不利
+            sens = sum(
+                w[i] * df_sel.iloc[i].get("YCスティープ感応度", 0.0)
+                for i in range(len(df_sel)))
+            pnl_j = sens * (move / 100) * aum / 1e6
+
+        elif name == "株式×金利クロスΓ":
+            # クロスガンマ項: PnL ≈ Σᵢ wᵢ×Γ_EQ_RATE × Δ_TOPIX × Δ_10Y
+            topix_move = moves[factor_names.index("TOPIX変化率")]
+            rate10y_move = moves[factor_names.index("長期金利変化(10Y JGB)")]
+            cg_sens = sum(w[i] * abs(df_sel.iloc[i].get("クロスΓ(株×金利)", 0.03))
+                          for i in range(len(df_sel)))
+            pnl_j = -cg_sens * abs(topix_move / 100) * abs(rate10y_move / 100) * aum / 1e6 * abs(move)
+
+        elif name == "クレジットスプレッド":
+            fin_w = sum(w[i] for i in range(len(df_sel))
+                        if df_sel.iloc[i]["セクター"] in ("金融", "不動産"))
+            credit_sens_port = sum(w[i] * abs(df_sel.iloc[i].get("クレジット感応度", -0.3))
+                                   for i in range(len(df_sel)))
+            pnl_j = -fin_w * (move / 100) * aum * 0.8 / 1e6 - credit_sens_port * (move / 100) * aum * 0.3 / 1e6
+
+        elif name == "ハイイールドスプレッド":
+            hy_sens_port = sum(
+                w[i] * abs(df_sel.iloc[i].get("HY感応度", -0.2)) *
+                abs(sector_hy_mult.get(df_sel.iloc[i]["セクター"], -0.2))
+                for i in range(len(df_sel)))
+            pnl_j = -hy_sens_port * (move / 100) * aum * 0.5 / 1e6
+
+        elif name == "原油価格変化率":
+            energy_w  = sum(w[i] for i in range(len(df_sel)) if df_sel.iloc[i]["セクター"] == "エネルギー")
+            consumer_w = sum(w[i] for i in range(len(df_sel)) if df_sel.iloc[i]["セクター"] == "消費財")
+            oil_sens_port = sum(w[i] * df_sel.iloc[i].get("原油感応度", 0.0) for i in range(len(df_sel)))
+            pnl_j = (energy_w * 0.6 - consumer_w * 0.3) * (move / 100) * aum / 1e6 \
+                    + oil_sens_port * (move / 100) * aum * 0.3 / 1e6
+
+        elif name == "金価格変化率":
+            gold_sens_port = sum(w[i] * df_sel.iloc[i].get("金感応度", 0.0) for i in range(len(df_sel)))
+            pnl_j = gold_sens_port * (move / 100) * aum / 1e6
+
         else:
-            growth = f'{last_gdp / first_gdp:,.2f}x'
-            delta_color = 'normal'
+            pnl_j = 0.0
 
-        st.metric(
-            label=f'{country} GDP',
-            value=f'{last_gdp:,.0f}B',
-            delta=growth,
-            delta_color=delta_color
+        pnl_total += pnl_j
+        pnl_by_factor.append({"ファクター": name, "変化量": move,
+                               "単位": fac["unit"], "カテゴリ": fac.get("category",""),
+                               "PnL（百万円）": pnl_j})
+
+    return pnl_total, pnl_by_factor
+
+def classify_scenario(levels_idx, top_n=3):
+    """コサイン類似度でシナリオ分類（dict形式signs対応）"""
+    factor_names = [f["name"] for f in RST_FACTORS]
+    moves_sign = np.sign([RST_FACTORS[j]["levels"][int(levels_idx[j])]
+                          for j in range(N_RST_FACTORS)])
+    scores = []
+    for sc_name, info in SCENARIO_LIBRARY.items():
+        if sc_name.startswith("_"):   # 削除済みエントリをスキップ
+            continue
+        signs_spec = info.get("signs", {})
+        if isinstance(signs_spec, dict):
+            tmpl = np.zeros(N_RST_FACTORS)
+            for fname, sign in signs_spec.items():
+                idx = _fi(fname)
+                if idx >= 0:
+                    tmpl[idx] = sign
+        else:
+            # 旧list形式（後方互換）
+            tmpl = np.array(list(signs_spec) + [0]*(N_RST_FACTORS - len(signs_spec)), dtype=float)
+        denom = np.linalg.norm(moves_sign) * np.linalg.norm(tmpl)
+        sim = float(np.dot(moves_sign, tmpl)) / (denom + 1e-9)
+        scores.append((sc_name, sim, info))
+    scores.sort(key=lambda x: -x[1])
+    return scores[:top_n]
+
+def is_conventional_scenario(levels_idx):
+    """全ファクターが単調に同方向のシンプルなシナリオは"想定内"と判定"""
+    signs = [np.sign(RST_FACTORS[j]["levels"][int(levels_idx[j])])
+             for j in range(N_RST_FACTORS)]
+    nonzero = [s for s in signs if s != 0]
+    if len(nonzero) == 0:
+        return True
+    # 全同方向 or 片側だけ = 想定内
+    return len(set(nonzero)) == 1 or len(nonzero) <= 2
+
+# ── 古典ソルバー ─────────────────────────────────────────────────────────────
+def rst_greedy(w, df_sel, aum, n_iter=20):
+    """座標降下法：1ファクターずつ最悪水準に設定"""
+    best_idx = np.array([3]*N_RST_FACTORS, dtype=int)  # 初期: ゼロ水準
+    t0 = time.perf_counter()
+    for _ in range(n_iter):
+        improved = False
+        for j in range(N_RST_FACTORS):
+            best_l, best_pnl = best_idx[j], 1e18
+            for l in range(N_RST_LEVELS):
+                tmp = best_idx.copy(); tmp[j] = l
+                pnl, _ = calc_rst_pnl(tmp, w, df_sel, aum)
+                if pnl < best_pnl:
+                    best_pnl, best_l = pnl, l
+            if best_l != best_idx[j]:
+                best_idx[j] = best_l; improved = True
+        if not improved:
+            break
+    elapsed = time.perf_counter() - t0
+    pnl, pnl_by_fac = calc_rst_pnl(best_idx, w, df_sel, aum)
+    return best_idx, pnl, elapsed
+
+def rst_random(w, df_sel, aum, n_iter=1000, seed=42):
+    rng = np.random.default_rng(seed)
+    best_idx = rng.integers(0, N_RST_LEVELS, N_RST_FACTORS)
+    best_pnl, _ = calc_rst_pnl(best_idx, w, df_sel, aum)
+    history = [best_pnl]
+    t0 = time.perf_counter()
+    for _ in range(n_iter):
+        idx = rng.integers(0, N_RST_LEVELS, N_RST_FACTORS)
+        pnl, _ = calc_rst_pnl(idx, w, df_sel, aum)
+        if pnl < best_pnl:
+            best_pnl, best_idx = pnl, idx.copy()
+        history.append(best_pnl)
+    return best_idx, best_pnl, time.perf_counter() - t0, history
+
+def rst_sa(w, df_sel, aum, T_init=500.0, T_min=0.5, alpha=0.99, seed=0):
+    rng = np.random.default_rng(seed)
+    cur_idx, _, _ = rst_greedy(w, df_sel, aum)
+    cur_pnl, _ = calc_rst_pnl(cur_idx, w, df_sel, aum)
+    best_idx, best_pnl = cur_idx.copy(), cur_pnl
+    T = T_init; history = []; cnt = 0
+    t0 = time.perf_counter()
+    while T > T_min:
+        for _ in range(15):
+            new_idx = cur_idx.copy()
+            j = rng.integers(0, N_RST_FACTORS)
+            new_idx[j] = rng.integers(0, N_RST_LEVELS)
+            new_pnl, _ = calc_rst_pnl(new_idx, w, df_sel, aum)
+            delta = new_pnl - cur_pnl
+            if delta < 0 or rng.random() < math.exp(-abs(delta)/(T+0.1)):
+                cur_idx, cur_pnl = new_idx, new_pnl
+                if cur_pnl < best_pnl:
+                    best_pnl, best_idx = cur_pnl, cur_idx.copy()
+            cnt += 1
+        history.append((cnt, best_pnl))
+        T *= alpha
+    return best_idx, best_pnl, time.perf_counter() - t0, history
+
+# ══════════════════════════════════════════════════════════════════════════════
+# セッション状態
+# ══════════════════════════════════════════════════════════════════════════════
+_DEFAULTS = dict(
+    mandate_saved=False, amplify_token="",
+    aum=5_000_000_000, benchmark="TOPIX", risk_mode="バランス型",
+    n_holdings=20, var_limit=0.02, te_limit=0.05,
+    sector_max=0.30, pos_max=0.10, liquidity_min=100,
+    opt_result=None, universe_df=None, return_matrix=None, cov_matrix=None,
+    rst_result=None,
+    portfolio_override=None,   # 手補正済みDF（None = 未補正）
+    edit_history=[],           # 変更履歴ログ
+)
+for k, v in _DEFAULTS.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
+# ══════════════════════════════════════════════════════════════════════════════
+# サイドバー
+# ══════════════════════════════════════════════════════════════════════════════
+with st.sidebar:
+    st.markdown("## 📡 量子ポートフォリオ")
+    st.markdown("**RST Trader Edition**")
+    st.divider()
+    st.markdown("#### Fixstars Amplify トークン")
+    tok = st.text_input("", value=st.session_state.amplify_token,
+                        type="password", label_visibility="collapsed")
+    if tok:
+        st.session_state.amplify_token = tok
+
+    st.divider()
+    page = st.selectbox("ナビゲーション", [
+        "🏠 システム概要",
+        "⚙️ 投資マンデート設定",
+        "🔬 量子最適化実行",
+        "📡 トレーダーダッシュボード",
+        "🔍 リバースストレステスト",
+        "📋 運用レポート",
+    ])
+    st.divider()
+    st.caption("Powered by Fixstars Amplify AE")
+    st.caption("© TESTROGY Inc.")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 1 ── システム概要
+# ══════════════════════════════════════════════════════════════════════════════
+if page == "🏠 システム概要":
+    # ── ヒーローバナー ──────────────────────────────────────────────────────
+    st.markdown("""
+<div style="
+  background: linear-gradient(135deg,rgba(0,200,230,0.07) 0%,rgba(123,47,190,0.07) 60%,rgba(0,128,255,0.06) 100%);
+  border:1px solid rgba(0,200,230,0.18);
+  border-radius:20px;
+  padding:2rem 2.2rem 1.6rem;
+  margin-bottom:1.2rem;
+  backdrop-filter:blur(20px);
+  position:relative;
+  overflow:hidden;
+">
+  <div style="position:absolute;top:0;left:0;right:0;height:2px;background:linear-gradient(90deg,#00c8e8,#7b2fbe,#00c8e8);background-size:200%;animation:shimmer 3s linear infinite;"></div>
+  <div style="position:absolute;bottom:-40px;right:-40px;width:200px;height:200px;background:radial-gradient(circle,rgba(0,200,230,0.06),transparent 70%);"></div>
+  <div style="display:flex;align-items:flex-start;gap:1.2rem;">
+    <div style="font-size:3rem;line-height:1;filter:drop-shadow(0 0 12px rgba(0,200,230,0.6));">⚛️</div>
+    <div>
+      <div style="font-size:1.8rem;font-weight:800;background:linear-gradient(135deg,#00c8e8 0%,#a78bfa 60%,#38bdf8 100%);-webkit-background-clip:text;-webkit-text-fill-color:transparent;background-clip:text;line-height:1.2;letter-spacing:-0.5px;">量子ポートフォリオ最適化 × RST</div>
+      <div style="font-size:0.84rem;color:#475569;margin-top:0.45rem;line-height:1.6;">
+        Fixstars Amplify AE &nbsp;×&nbsp; SABR/Vanna-Volga &nbsp;×&nbsp; <span style="color:#00c8e8;font-weight:600;">108リスクファクター</span> &nbsp;×&nbsp; <span style="color:#a78bfa;font-weight:600;">7<sup>108</sup>≈10<sup>91</sup>通りの探索空間</span>
+      </div>
+    </div>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+    # ── KPIカード ────────────────────────────────────────────────────────────
+    c1, c2, c3, c4 = st.columns(4)
+    for col, icon, title, val, sub, cls in [
+        (c1, "🔬", "最大ユニバース",  "500銘柄",       "東証プライム全銘柄",      ""),
+        (c2, "📉", "対応リスク指標",  "7種類",         "VaR/CVaR/TE/HHI等",       ""),
+        (c3, "⚛️", "量子探索空間",   "7¹⁰⁸≈10⁹¹",  "108ファクター×7水準",     "info"),
+        (c4, "🔍", "シナリオライブラリ","8+シナリオ",  "δ/Γ/ν/ヘッジ自動生成",  "warn"),
+    ]:
+        col.markdown(f"""<div class="kpi-card {cls}">
+        <div class="kpi-title">{icon} {title}</div>
+        <div class="kpi-value" style="font-size:1.25rem">{val}</div>
+        <div class="kpi-sub">{sub}</div></div>""", unsafe_allow_html=True)
+
+    st.markdown('<div class="sec-hdr">🔄 最適化パイプライン</div>', unsafe_allow_html=True)
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown("""<div class="flow-box">
+        <b>Phase 1: 量子アニーリング（銘柄選択）</b><br><br>
+        ① ユニバースを流動性・セクターでフィルタリング<br>
+        ② QUBOモデル構築（分散最小・リターン最大・セクターペナルティ）<br>
+        ③ Fixstars Amplify AE で高速組合せ最適化<br>
+        ④ 制約充足銘柄セットを出力
+        </div>""", unsafe_allow_html=True)
+        st.markdown("""<div class="flow-box" style="margin-top:0.5rem">
+        <b>Phase 2: IPOPT ウェイト最適化</b><br><br>
+        ① 選出銘柄の共分散行列を推定<br>
+        ② 平均分散最適化（スタイル別リスク回避係数）<br>
+        ③ VaR / CVaR / TE 制約を充足<br>
+        ④ 非線形ソルバで精緻化
+        </div>""", unsafe_allow_html=True)
+    with c2:
+        st.markdown("""<div class="flow-box">
+        <b>Phase 3: リバースストレステスト（量子優位性強化版）</b><br><br>
+        ① 108マーケットファクター × 7水準（7¹⁰⁸≈10⁹¹通り）<br>
+        ② デルタ＋ガンマ＋クロスガンマのPnL計算モデル<br>
+        ③ QUBOでPnL最小化シナリオを量子探索<br>
+        ④ 「想定外シナリオ」vs「想定内シナリオ」を自動判別<br>
+        ⑤ シナリオの経済的背景・規制影響・ヘッジ手段を付与
+        </div>""", unsafe_allow_html=True)
+        st.markdown("""<div class="flow-box" style="margin-top:0.5rem">
+        <b>📡 トレーダーダッシュボード</b><br><br>
+        ✅ 市場ファクター別 P&L ブレイクダウン<br>
+        ✅ セクター別 / 銘柄別 損益モニタリング<br>
+        ✅ サマリー → ドリルダウン形式<br>
+        ✅ 量子必要性の正直な評価パネル
+        </div>""", unsafe_allow_html=True)
+
+    # 量子必要性プレビュー
+    st.markdown('<div class="sec-hdr purple">⚛️ 量子アニーリングは本当に必要か？</div>', unsafe_allow_html=True)
+    st.markdown("""<div class="alert-info">
+    💡 <b>正直な評価：</b>
+    本システムでは「量子が必要なケース」と「古典で十分なケース」を明示します。
+    RSTにおける量子の主な優位性は「<b>想定外の複合シナリオ発見</b>」であり、
+    「計算速度」ではありません。リアルタイム計算が必要かどうかは用途次第です。
+    </div>""", unsafe_allow_html=True)
+    c1, c2, c3 = st.columns(3)
+    c1.markdown("""<div class="scenario-card blue">
+    <b>🟢 量子が有効なケース</b><br><br>
+    • ファクター数が多く探索空間が爆発的に大きい<br>
+    • クロスファクター相関が複雑で局所最適が多い<br>
+    • 制約条件が複数絡み合っている<br>
+    • 想定外の複合シナリオ発見が目的
+    </div>""", unsafe_allow_html=True)
+    c2.markdown("""<div class="scenario-card amber">
+    <b>🟡 古典で十分なケース</b><br><br>
+    • ファクター数が少ない（6未満）<br>
+    • 水準数が粗い（3〜5水準）<br>
+    • 単独ファクター最悪化が主目的<br>
+    • 高速性より解釈しやすさが重要
+    </div>""", unsafe_allow_html=True)
+    c3.markdown("""<div class="scenario-card">
+    <b>⚠️ コスト・ベネフィット考慮点</b><br><br>
+    • 収益増加ではなく損失限定が目的<br>
+    • リアルタイム性の必要度を精査<br>
+    • バッチ実行なら古典でも解決可<br>
+    • 規制要件・監査対応に価値あり
+    </div>""", unsafe_allow_html=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 2 ── 投資マンデート設定
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "⚙️ 投資マンデート設定":
+    st.title("⚙️ 投資マンデート設定")
+
+    with st.form("mandate_form"):
+        st.markdown('<div class="sec-hdr">💼 基本運用情報</div>', unsafe_allow_html=True)
+        c1, c2 = st.columns(2)
+        with c1:
+            aum = st.number_input("運用資産額（AUM）[円]", min_value=100_000_000,
+                                   max_value=1_000_000_000_000,
+                                   value=st.session_state.aum, step=500_000_000, format="%d")
+            benchmark = st.selectbox("ベンチマーク",
+                ["TOPIX","日経225","MSCI Japan","カスタム（等ウェイト）"])
+        with c2:
+            risk_mode = st.selectbox("運用スタイル",
+                ["保守型（低リスク）","バランス型","積極型（高リスク）"],
+                index=1)
+            n_holdings = st.slider("目標保有銘柄数", 10, 80,
+                                    st.session_state.n_holdings, 5)
+
+        st.markdown('<div class="sec-hdr amber">⚠️ リスク制約条件</div>', unsafe_allow_html=True)
+        c1, c2, c3 = st.columns(3)
+        with c1:
+            var_limit = st.slider("VaR上限（99%, 1日）[%]", 0.5, 5.0,
+                                   float(st.session_state.var_limit*100), 0.1) / 100
+        with c2:
+            te_limit  = st.slider("トラッキングエラー上限（年率）[%]", 1.0, 15.0,
+                                   float(st.session_state.te_limit*100), 0.5) / 100
+        with c3:
+            sector_max = st.slider("セクター最大ウェイト [%]", 10, 50,
+                                    int(st.session_state.sector_max*100), 5) / 100
+        c1, c2 = st.columns(2)
+        with c1:
+            pos_max = st.slider("個別銘柄最大ウェイト [%]", 1, 30,
+                                 int(st.session_state.pos_max*100), 1) / 100
+        with c2:
+            liquidity_min = st.number_input("最低日次出来高 [百万円/日]", 10, 10000,
+                                             value=st.session_state.liquidity_min, step=10)
+
+        if st.form_submit_button("✅ マンデートを保存して次へ",
+                                  use_container_width=True, type="primary"):
+            st.session_state.update({
+                "aum": aum, "benchmark": benchmark, "risk_mode": risk_mode,
+                "n_holdings": n_holdings, "var_limit": var_limit, "te_limit": te_limit,
+                "sector_max": sector_max, "pos_max": pos_max,
+                "liquidity_min": liquidity_min, "mandate_saved": True,
+            })
+            st.success("✅ 投資マンデートを保存しました。「量子最適化実行」へ進んでください。")
+
+    if st.session_state.mandate_saved:
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("AUM", f"¥{st.session_state.aum/1e8:.0f}億円")
+        c2.metric("ベンチマーク", st.session_state.benchmark)
+        c3.metric("VaR上限", f"{st.session_state.var_limit*100:.1f}%")
+        c4.metric("TE上限",  f"{st.session_state.te_limit*100:.1f}%")
+        c5.metric("目標銘柄数", f"{st.session_state.n_holdings}銘柄")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 3 ── 量子最適化実行
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "🔬 量子最適化実行":
+    st.title("🔬 量子最適化実行")
+
+    if not st.session_state.mandate_saved:
+        st.warning("⚠️ 先に「投資マンデート設定」でマンデートを保存してください。")
+        st.stop()
+
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("AUM", f"¥{st.session_state.aum/1e8:.0f}億円")
+    c2.metric("目標銘柄数", f"{st.session_state.n_holdings}銘柄")
+    c3.metric("VaR上限", f"{st.session_state.var_limit*100:.1f}%")
+    c4.metric("TE上限",  f"{st.session_state.te_limit*100:.1f}%")
+    st.divider()
+
+    st.markdown('<div class="sec-hdr slate">🗂️ 投資ユニバース設定</div>', unsafe_allow_html=True)
+    c1, c2 = st.columns(2)
+    with c1:
+        selected_sectors = st.multiselect("対象セクター", SECTORS, default=SECTORS)
+        n_universe = st.slider("ユニバース規模（上位N社）", 20, 200, 100, step=10)
+    with c2:
+        st.info("デモモードでは合成データを使用します（Amplify トークンなしでも動作確認可）。")
+
+    run_btn = st.button("🚀 量子最適化を開始", type="primary", use_container_width=True)
+
+    if run_btn:
+        prog = st.progress(0); status = st.empty()
+
+        status.info("📥 Step 1/4: 投資ユニバースを読み込み中...")
+        prog.progress(5)
+        df_univ = build_universe(n_universe)
+        df_univ = df_univ[df_univ["平均出来高（百万円/日）"] >= st.session_state.liquidity_min]
+        if selected_sectors:
+            df_univ = df_univ[df_univ["セクター"].isin(selected_sectors)]
+        df_univ = df_univ.head(n_universe).reset_index(drop=True)
+        N = len(df_univ)
+
+        if N < st.session_state.n_holdings:
+            st.error(f"ユニバース規模（{N}社）が目標銘柄数（{st.session_state.n_holdings}銘柄）を下回ります。")
+            st.stop()
+
+        ret_mat = build_returns(N)
+        cov_mat = np.cov(ret_mat.T)
+        st.session_state.universe_df   = df_univ
+        st.session_state.return_matrix = ret_mat
+        st.session_state.cov_matrix    = cov_mat
+        prog.progress(20)
+
+        status.info("⚛️ Step 2/4: QUBOモデルを構築中...")
+        prog.progress(30)
+
+        exp_ret = df_univ["期待リターン（年率）"].values
+        sharpes = df_univ["シャープレシオ"].values
+        vols    = df_univ["ボラティリティ（年率）"].values
+
+        style_params = {
+            "保守型（低リスク）": dict(lv=3.0, lr=0.5, ls=1.0),
+            "バランス型":         dict(lv=1.5, lr=1.5, ls=1.5),
+            "積極型（高リスク）": dict(lv=0.5, lr=3.0, ls=2.5),
+        }
+        sp = style_params.get(st.session_state.risk_mode, style_params["バランス型"])
+        K  = st.session_state.n_holdings
+
+        gen = VariableGenerator()
+        q   = gen.array("Binary", N)
+
+        Q_var    = sum(cov_mat[i][j]*q[i]*q[j] for i in range(N) for j in range(N))
+        Q_ret    = sum(-exp_ret[i]*q[i] for i in range(N))
+        Q_sharpe = sum(-sharpes[i]*q[i] for i in range(N))
+
+        sec_max_cnt = max(1, int(st.session_state.sector_max * K))
+        Q_sec_pen = 0
+        for sec in SECTORS:
+            idxs = df_univ[df_univ["セクター"] == sec].index.tolist()
+            if idxs:
+                s = sum(q[i] for i in idxs)
+                Q_sec_pen += (s - sec_max_cnt) * (s - sec_max_cnt)
+
+        objective = sp["lv"]*Q_var + sp["lr"]*Q_ret + sp["ls"]*Q_sharpe + Q_sec_pen
+        model = Model(objective, 5.0 * equal_to(sum(q[i] for i in range(N)), K))
+        prog.progress(50)
+
+        status.info("🔄 Step 3/4: Fixstars Amplify AE 量子アニーリング実行中...")
+        prog.progress(55)
+
+        q_vals = np.zeros(N)
+        token  = st.session_state.amplify_token
+        if token:
+            try:
+                client = FixstarsClient()
+                client.token = token
+                client.parameters.timeout = timedelta(seconds=5.0)
+                result = solve(model, client)
+                if len(result) > 0:
+                    q_vals = np.array(q.evaluate(result.best.values))
+                    status.info(f"✅ 量子AE完了 (エネルギー: {result.best.objective:.6f})")
+                else:
+                    top_k = np.argsort(sharpes)[-K:]
+                    q_vals[top_k] = 1
+            except Exception as e:
+                st.warning(f"Amplify AE エラー: {e} → デモ実行")
+                score = sp["lr"]*exp_ret - sp["lv"]*vols + sp["ls"]*sharpes
+                q_vals[np.argsort(score)[-K:]] = 1
+        else:
+            st.warning("⚠️ Amplify トークン未設定。スコア上位銘柄でデモ実行します。")
+            score = sp["lr"]*exp_ret - sp["lv"]*vols + sp["ls"]*sharpes
+            q_vals[np.argsort(score)[-K:]] = 1
+
+        sel_idx = np.where(q_vals == 1)[0]
+        df_sel  = df_univ.iloc[sel_idx].copy().reset_index(drop=True)
+        prog.progress(70)
+
+        status.info("⚙️ Step 4/4: IPOPT ウェイト最適化中...")
+        prog.progress(72)
+
+
+
+        n_sel   = len(sel_idx)
+        cov_sel = cov_mat[np.ix_(sel_idx, sel_idx)]
+        ret_sel = exp_ret[sel_idx]
+
+        gamma_map = {"保守型（低リスク）": 6.0, "バランス型": 2.5, "積極型（高リスク）": 0.8}
+        gamma = gamma_map.get(st.session_state.risk_mode, 2.5)
+
+        # ── 目的関数： -期待リターン + γ·分散（IPOPT版と同一） ──
+        def objective(w):
+            return -ret_sel @ w + gamma * (w @ cov_sel @ w)
+
+        # 解析的な勾配（収束が速く安定する）
+        def objective_grad(w):
+            return -ret_sel + 2.0 * gamma * (cov_sel @ w)
+
+        # ── 制約： Σw = 1 ──
+        constraints = [{
+            "type": "eq",
+            "fun":  lambda w: np.sum(w) - 1.0,
+            "jac":  lambda w: np.ones_like(w),
+        }]
+
+        # ── 変数境界： 0 ≤ w_i ≤ pos_max ──
+        bounds = [(0.0, st.session_state.pos_max)] * n_sel
+
+        # ── 初期解：等ウェイト ──
+        w0 = np.full(n_sel, 1.0 / n_sel)
+
+        res = minimize(
+            objective, w0,
+            method="SLSQP",
+            jac=objective_grad,
+            bounds=bounds,
+            constraints=constraints,
+            options={"maxiter": 500, "ftol": 1e-9},
         )
+
+        weights = np.clip(res.x, 0, None)
+        weights /= weights.sum() + 1e-12
+
+
+
+
+
+
+
+
+        df_sel["最適ウェイト（%）"] = (weights*100).round(2)
+        df_sel["投資金額（円）"]   = (weights*st.session_state.aum).round(-3).astype(int)
+        df_sel["推定口数"]         = (df_sel["投資金額（円）"]/df_sel["株価（円）"]).astype(int)
+
+        rm_sel  = ret_mat[:, sel_idx]
+        pv      = portfolio_var_hist(weights, rm_sel)
+        pcv     = portfolio_cvar_hist(weights, rm_sel)
+        pvol    = portfolio_vol(weights, cov_sel)
+        pret    = float(ret_sel @ weights)
+        psharpe = pret / (pvol + 1e-8)
+        pbeta   = float((df_sel["ベータ"].values * weights).sum())
+        phhi    = hhi(weights)
+        bench_w = np.ones(n_sel) / n_sel
+        te      = tracking_error(weights, bench_w, cov_sel)
+
+        # ファクター別期待P&L（通常時）
+        factor_pnls_normal = {}
+        for fac in RST_FACTORS:
+            name = fac["name"]
+            move = fac["levels"][3]  # ゼロ水準
+            factor_pnls_normal[name] = 0.0
+
+        st.session_state.opt_result = dict(
+            df_sel=df_sel, weights=weights, sel_idx=sel_idx,
+            cov_sel=cov_sel, rm_sel=rm_sel,
+            port_var=pv, port_cvar=pcv, port_vol=pvol, port_ret=pret,
+            port_sharpe=psharpe, port_beta=pbeta, port_hhi=phhi, te=te,
+            var_breach=(pv > st.session_state.var_limit),
+            te_breach=(te > st.session_state.te_limit),
+        )
+        st.session_state.rst_result = None  # 再最適化時はリセット
+        prog.progress(100)
+        status.success("🎉 最適化完了！「トレーダーダッシュボード」または「RST」ページへ進んでください。")
+
+        # プレビュー
+        c1, c2, c3, c4, c5 = st.columns(5)
+        c1.metric("期待リターン（年率）",   f"{pret*100:.2f}%")
+        c2.metric("ボラティリティ（年率）", f"{pvol*100:.2f}%")
+        c3.metric("シャープレシオ",         f"{psharpe:.2f}")
+        c4.metric("VaR 99%（1日）",         f"{pv*100:.2f}%",
+                  delta="⚠️超過" if pv > st.session_state.var_limit else "✅正常",
+                  delta_color="inverse" if pv > st.session_state.var_limit else "normal")
+        c5.metric("TE（年率）", f"{te*100:.2f}%",
+                  delta="⚠️超過" if te > st.session_state.te_limit else "✅正常",
+                  delta_color="inverse" if te > st.session_state.te_limit else "normal")
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 4 ── トレーダーダッシュボード
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "📡 トレーダーダッシュボード":
+    st.title("📡 トレーダーダッシュボード")
+    st.markdown("##### マーケット × P&L × ポジション — サマリーからドリルダウン")
+
+    if st.session_state.opt_result is None:
+        st.warning("⚠️ 先に「量子最適化実行」を完了してください。")
+        st.stop()
+
+    r   = st.session_state.opt_result
+    df  = r["df_sel"]
+    w   = r["weights"]
+    aum = st.session_state.aum
+
+    # ══ LAYER 1: サマリーKPI（全体像） ═══════════════════════════════════════
+    st.markdown('<div class="sec-hdr">📊 LAYER 1 — ポートフォリオ全体サマリー</div>', unsafe_allow_html=True)
+
+    c1, c2, c3, c4, c5, c6 = st.columns(6)
+    kpis = [
+        (c1, "期待リターン",  f"{r['port_ret']*100:.2f}%", "年率", ""),
+        (c2, "ボラティリティ",f"{r['port_vol']*100:.2f}%", "年率",  "warn" if r['port_vol']>0.2 else "ok"),
+        (c3, "シャープレシオ",f"{r['port_sharpe']:.3f}",   "高いほど良い", "ok" if r['port_sharpe']>0.5 else "warn"),
+        (c4, "VaR 99%(1日)",  f"{r['port_var']*100:.2f}%", f"上限{st.session_state.var_limit*100:.1f}%", "danger" if r['var_breach'] else "ok"),
+        (c5, "TE（年率）",    f"{r['te']*100:.2f}%",        f"上限{st.session_state.te_limit*100:.1f}%",  "danger" if r['te_breach'] else "ok"),
+        (c6, "HHI集中度",     f"{r['port_hhi']:.4f}",       "0=分散, 1=集中", "warn" if r['port_hhi']>0.05 else "ok"),
+    ]
+    for col, title, val, sub, cls in kpis:
+        col.markdown(f"""<div class="kpi-card {cls}">
+        <div class="kpi-title">{title}</div>
+        <div class="kpi-value" style="font-size:1.3rem">{val}</div>
+        <div class="kpi-sub">{sub}</div></div>""", unsafe_allow_html=True)
+
+    # 制約充足アラート
+    if r["var_breach"]:
+        st.markdown(f'<div class="alert-err">🚨 VaR {r["port_var"]*100:.2f}% が上限 {st.session_state.var_limit*100:.1f}% を超過しています。ポジション縮小を検討してください。</div>', unsafe_allow_html=True)
+    else:
+        st.markdown(f'<div class="alert-ok">✅ VaR {r["port_var"]*100:.2f}% — 制約充足（上限 {st.session_state.var_limit*100:.1f}%）</div>', unsafe_allow_html=True)
+
+    if r["te_breach"]:
+        st.markdown(f'<div class="alert-err">🚨 TE {r["te"]*100:.2f}% が上限 {st.session_state.te_limit*100:.1f}% を超過しています。</div>', unsafe_allow_html=True)
+    else:
+        st.markdown(f'<div class="alert-ok">✅ TE {r["te"]*100:.2f}% — 制約充足（上限 {st.session_state.te_limit*100:.1f}%）</div>', unsafe_allow_html=True)
+
+    st.divider()
+
+    # ══ LAYER 2: マーケットファクター別P&L ════════════════════════════════════
+    st.markdown('<div class="sec-hdr amber">📉 LAYER 2 — マーケットファクター別 P&L ブレイクダウン</div>', unsafe_allow_html=True)
+    st.markdown("各ファクターが「1σ標準ショック」を受けた場合の推定損益（百万円）")
+
+    # 1σシナリオ計算
+    sigma_scenarios = {
+        "TOPIX変化率":         {"idx": 0, "sigma_move": -7,  "unit": "%"},
+        "USD/JPY変化率":       {"idx": 1, "sigma_move": -5,  "unit": "%"},
+        "金利変化(10Y JGB)":   {"idx": 2, "sigma_move": 30,  "unit": "bps"},
+        "VIX変化":             {"idx": 3, "sigma_move": 15,  "unit": "pts"},
+        "クレジットスプレッド": {"idx": 4, "sigma_move": 30,  "unit": "bps"},
+        "原油価格変化率":      {"idx": 5, "sigma_move": -12, "unit": "%"},
+    }
+
+    factor_pnl_rows = []
+    for fname, info in sigma_scenarios.items():
+        tmp_idx = [3]*N_RST_FACTORS  # ゼロ水準
+        tmp_idx[info["idx"]] = [abs(RST_FACTORS[info["idx"]]["levels"][l] - info["sigma_move"])
+                                 for l in range(N_RST_LEVELS)].index(
+                                    min(abs(RST_FACTORS[info["idx"]]["levels"][l] - info["sigma_move"])
+                                        for l in range(N_RST_LEVELS)))
+        _, pnl_by_fac = calc_rst_pnl(tmp_idx, w, df, aum)
+        pnl_j = pnl_by_fac[info["idx"]]["PnL（百万円）"]
+        factor_pnl_rows.append({
+            "マーケットファクター": fname,
+            "ショック": f"{info['sigma_move']:+.0f}{info['unit']}（1σ相当）",
+            "推定P&L（百万円）": round(pnl_j, 1),
+            "推定損益率（%）": round(pnl_j / (aum/1e6) * 100, 3),
+            "方向": "🔴損失" if pnl_j < 0 else "🟢利益",
+            "color": RST_FACTORS[info["idx"]]["color"],
+        })
+
+    df_fac = pd.DataFrame(factor_pnl_rows)
+
+    c1, c2 = st.columns([1.2, 1])
+    with c1:
+        fig = go.Figure()
+        for _, row in df_fac.iterrows():
+            fig.add_trace(go.Bar(
+                x=[row["マーケットファクター"]],
+                y=[row["推定P&L（百万円）"]],
+                marker_color=row["color"] if row["推定P&L（百万円）"] >= 0 else "#dc2626",
+                text=[f"{row['推定P&L（百万円）']:+.1f}"],
+                textposition="outside",
+                name=row["マーケットファクター"],
+                showlegend=False,
+            ))
+        fig.add_hline(y=0, line_color="#999", line_width=1)
+        fig.update_layout(
+            title="マーケットファクター別 1σショック時 推定P&L（百万円）",
+            yaxis_title="推定P&L（百万円）",
+            height=360, plot_bgcolor="#f8f9fc",
+            xaxis={"tickangle": -20},
+        )
+        st.plotly_chart(fig, use_container_width=True)
+    with c2:
+        st.dataframe(df_fac[["マーケットファクター","ショック","推定P&L（百万円）","方向"]],
+                     use_container_width=True, hide_index=True,
+                     column_config={
+                         "推定P&L（百万円）": st.column_config.NumberColumn(format="%.1f"),
+                     })
+        total_stress = df_fac["推定P&L（百万円）"].sum()
+        st.markdown(f"""<div class="kpi-card {'danger' if total_stress < 0 else 'ok'}">
+        <div class="kpi-title">全ファクター1σ同時ショック</div>
+        <div class="kpi-value {'red' if total_stress < 0 else 'grn'}">{total_stress:+,.0f}</div>
+        <div class="kpi-sub">百万円（推定合計損益）</div></div>""", unsafe_allow_html=True)
+
+    st.divider()
+
+    # ══ LAYER 3: セクター別ブレイクダウン ═════════════════════════════════════
+    st.markdown('<div class="sec-hdr green">🏭 LAYER 3 — セクター別 ウェイト・リスク ブレイクダウン</div>', unsafe_allow_html=True)
+
+    sec_df = df.groupby("セクター").agg(
+        銘柄数=("銘柄名", "count"),
+        ウェイト合計=("最適ウェイト（%）", "sum"),
+        投資金額合計=("投資金額（円）", "sum"),
+        期待リターン平均=("期待リターン（年率）", "mean"),
+        ボラティリティ平均=("ボラティリティ（年率）", "mean"),
+        ベータ平均=("ベータ", "mean"),
+    ).reset_index()
+    sec_df["期待リターン平均"] = (sec_df["期待リターン平均"]*100).round(2)
+    sec_df["ボラティリティ平均"] = (sec_df["ボラティリティ平均"]*100).round(2)
+    sec_df["ベータ平均"] = sec_df["ベータ平均"].round(2)
+
+    c1, c2 = st.columns(2)
+    with c1:
+        fig_sec = px.bar(sec_df.sort_values("ウェイト合計", ascending=True),
+                         x="ウェイト合計", y="セクター", orientation="h",
+                         color="ボラティリティ平均", color_continuous_scale="RdYlGn_r",
+                         title="セクター別ウェイト（色=ボラティリティ平均）",
+                         text="ウェイト合計")
+        fig_sec.add_vline(x=st.session_state.sector_max*100, line_dash="dash",
+                           line_color="red", annotation_text=f"上限{st.session_state.sector_max*100:.0f}%")
+        fig_sec.update_traces(texttemplate="%{text:.1f}%")
+        fig_sec.update_layout(height=380, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(5,13,26,0.6)", font=dict(color="#ffffff"), xaxis=dict(gridcolor="rgba(255,255,255,0.05)", tickfont=dict(color="#64748b")), yaxis=dict(gridcolor="rgba(255,255,255,0.05)", tickfont=dict(color="#64748b")))
+        st.plotly_chart(fig_sec, use_container_width=True)
+    with c2:
+        # セクター別期待リターン vs リスク
+        fig_scatter = px.scatter(sec_df, x="ボラティリティ平均", y="期待リターン平均",
+                                  size="ウェイト合計", color="セクター",
+                                  text="セクター", title="セクター別 リスク/リターン（バブル=ウェイト）",
+                                  height=380)
+        fig_scatter.update_traces(textposition="top center", textfont_size=9)
+        st.plotly_chart(fig_scatter, use_container_width=True)
+
+    # セクター詳細テーブル
+    with st.expander("🔍 セクター詳細テーブルを展開"):
+        st.dataframe(sec_df.sort_values("ウェイト合計", ascending=False),
+                     use_container_width=True, hide_index=True,
+                     column_config={
+                         "投資金額合計": st.column_config.NumberColumn(format="¥%d"),
+                         "ウェイト合計": st.column_config.NumberColumn(format="%.1f%%"),
+                     })
+
+    st.divider()
+
+    # ══ LAYER 4: 銘柄別ドリルダウン ═══════════════════════════════════════════
+    st.markdown('<div class="sec-hdr purple">🔍 LAYER 4 — 銘柄別 ポジション詳細</div>', unsafe_allow_html=True)
+
+    sel_sector = st.selectbox("セクターで絞り込む",
+                               ["全セクター"] + sorted(df["セクター"].unique().tolist()))
+    df_drill = df if sel_sector == "全セクター" else df[df["セクター"] == sel_sector]
+
+    # ウェイト vs リスク寄与グラフ
+    port_var_scalar = float(w @ r["cov_sel"] @ w)
+    mrc = (r["cov_sel"] @ w) / (port_var_scalar + 1e-12) * w
+    mrc_pct = mrc / mrc.sum() * 100
+    df_drill_full = df.copy()
+    df_drill_full["リスク寄与（%）"] = mrc_pct.round(2)
+    df_drill_display = df_drill_full if sel_sector == "全セクター" else df_drill_full[df_drill_full["セクター"] == sel_sector]
+
+    c1, c2 = st.columns(2)
+    with c1:
+        top15 = df_drill_display.nlargest(15, "最適ウェイト（%）")
+        fig_bar = go.Figure()
+        fig_bar.add_trace(go.Bar(name="ウェイト（%）", x=top15["銘柄名"],
+                                  y=top15["最適ウェイト（%）"], marker_color="#1d4ed8"))
+        fig_bar.add_trace(go.Bar(name="リスク寄与（%）", x=top15["銘柄名"],
+                                  y=top15["リスク寄与（%）"], marker_color="#dc2626"))
+        fig_bar.update_layout(barmode="group", title="ウェイト vs リスク寄与（上位15銘柄）", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(5,13,26,0.6)", font=dict(color="#ffffff"),
+                               height=360, xaxis={"tickangle": -30})
+        st.plotly_chart(fig_bar, use_container_width=True)
+    with c2:
+        fig_scatter2 = px.scatter(df_drill_display,
+                                   x="最適ウェイト（%）", y="リスク寄与（%）",
+                                   color="セクター", text="銘柄名",
+                                   title="ウェイト vs リスク寄与（散布図）",
+                                   height=360)
+        max_v = max(df_drill_display["最適ウェイト（%）"].max(),
+                    df_drill_display["リスク寄与（%）"].max())
+        fig_scatter2.add_shape(type="line", x0=0, y0=0, x1=max_v, y1=max_v,
+                                line=dict(dash="dash", color="gray"))
+        fig_scatter2.update_traces(textposition="top center", textfont_size=8)
+        st.plotly_chart(fig_scatter2, use_container_width=True)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # 銘柄詳細テーブル ── 手補正エディタ（108ファクター感応度）
+    # ══════════════════════════════════════════════════════════════════════════
+    with st.expander("✏️ 銘柄詳細テーブルを展開（感応度を手補正できます）", expanded=False):
+
+        # ── 編集対象DFの決定（手補正済みがあればそれを使う） ─────────────────
+        base_df = (st.session_state.portfolio_override
+                   if st.session_state.portfolio_override is not None
+                   else df_drill_full.copy())
+
+        # ── ロック列（編集不可）/ 編集可能列の分類 ────────────────────────────
+        LOCKED_COLS = {"コード","銘柄名","セクター",
+                       "最適ウェイト（%）","投資金額（円）","推定口数",
+                       "時価総額（億円）","平均出来高（百万円/日）",
+                       "リスク寄与（%）"}
+
+        _exist = set(base_df.columns)
+        def _cols(*names):
+            return [c for c in names if c in _exist]
+
+        base_cols = _cols("コード","銘柄名","セクター","最適ウェイト（%）",
+                          "投資金額（円）","推定口数","期待リターン（年率）",
+                          "ボラティリティ（年率）","シャープレシオ","ベータ",
+                          "時価総額（億円）","平均出来高（百万円/日）")
+
+        grp_A = _cols("TOPIX感応度","日経225感応度","小型株感応度","S&P500感応度",
+                      "アジア株感応度","欧州株感応度","中国株感応度",
+                      "ガンマ係数","NK225ガンマ係数",
+                      "バリュー/グロース感応度","モメンタム感応度","サイズファクター感応度",
+                      "クオリティ感応度","ローボラファクター感応度",
+                      "IT相対感応度","金融相対感応度","不動産相対感応度","エネルギー相対感応度",
+                      "高配当スプレッド感応度","クロスΓ(FX×株)")
+        grp_B = _cols("VIX感応度","VIX期間構造感応度","VVIX感応度",
+                      "日本株IV_ATM_1M感応度","日本株IV_ATM_3M感応度",
+                      "日本株IV_ATM_6M感応度","日本株IV_ATM_1Y感応度",
+                      "SABR_α感応度","SABR_β感応度","SABR_ρ感応度","SABR_ν感応度",
+                      "ボラスキュー_Put感応度","ボラスキュー_Call感応度",
+                      "ボラカートシス感応度","ディスパーション感応度","フォワードボラ感応度")
+        grp_C = _cols("FX感応度(USD)","FX感応度(EUR)","FX感応度(GBP)","FX感応度(AUD)",
+                      "FX感応度(CNH)","FX感応度(EURUSD)","新興国通貨感応度",
+                      "USDJPY_IV_1M感応度","USDJPY_IV_3M感応度",
+                      "VV_RR_1M感応度","VV_BF_1M感応度","VV_RR_3M感応度","VV_BF_3M感応度",
+                      "EUR_RR感応度","EUR_BF感応度","Vanna感応度","Volga感応度","FX相関感応度")
+        grp_D = _cols("金利感応度(1M)","金利感応度(3M)","金利感応度(6M)","金利感応度(1Y)",
+                      "金利感応度(2Y)","金利感応度(5Y)","金利感応度(10Y)",
+                      "金利感応度(20Y)","金利感応度(30Y)",
+                      "YC_スティープ(2Y-10Y)感応度","YC_スティープ(10Y-30Y)感応度","YC_バタフライ感応度",
+                      "スワップション1Y1Y感応度","スワップション5Y5Y感応度",
+                      "TONAR_OIS感応度","日米金利差感応度","実質金利感応度","クロスΓ(株×金利)")
+        grp_E = _cols("CDS_IG(日本)感応度","CDS_HY(日本)感応度",
+                      "CDX_IG(米国)感応度","CDX_HY(米国)感応度","iTraxx(欧州)感応度",
+                      "金融CDS感応度","不動産CDS感応度","シニア_サブSP感応度",
+                      "デフォルト相関感応度","リカバリーレート感応度",
+                      "フォーリングエンジェル感応度","クレジットΓ感応度")
+        grp_F = _cols("原油(1M)感応度","原油(12M)感応度","原油期間構造感応度",
+                      "天然ガス感応度","金感応度","銀感応度",
+                      "銅感応度","鉄鉱石感応度","農産物感応度",
+                      "OVX感応度","コモディティ相関感応度","クロスΓ(原油×FX)")
+        grp_G = _cols("Amihud流動性感応度","株式BA感応度","社債流動性感応度",
+                      "日銀BS感応度","GDP成長率感応度","CPI感応度","PMI感応度",
+                      "Put_Call比感応度","システミックリスク感応度","クロスΓ(流動性×株)")
+
+        ALL_EDITABLE_COLS = (
+            [c for c in base_cols if c not in LOCKED_COLS] +
+            grp_A + grp_B + grp_C + grp_D + grp_E + grp_F + grp_G
+        )
+
+        # ── 操作ガイド ──────────────────────────────────────────────────────
+        st.info(
+            "📝 **編集方法：** セルをクリックして直接入力。"
+            "グレーの列（コード・ウェイト等）は読み取り専用です。\n\n"
+            "⚠️ 感応度の変更は RST（リバースストレステスト）の損失計算に即座に反映されます。"
+        )
+
+        # ── 手補正ステータスバッジ ──────────────────────────────────────────
+        if st.session_state.portfolio_override is not None:
+            n_edited = (st.session_state.edit_history or [])
+            st.warning(f"✏️ **手補正モード：** {len(n_edited)}回の変更が蓄積されています。"
+                       " 「変更をリセット」で元の最適化結果に戻せます。")
+        else:
+            st.success("✅ 現在は最適化結果をそのまま使用しています（未補正）")
+
+        sort_base = base_df.sort_values("最適ウェイト（%）", ascending=False).reset_index(drop=True)
+
+        # ── column_config（ロック列は disabled=True） ─────────────────────
+        def _build_col_cfg(display_cols: list) -> dict:
+            cfg = {}
+            for col in display_cols:
+                if col in LOCKED_COLS:
+                    if col == "投資金額（円）":
+                        cfg[col] = st.column_config.NumberColumn(col, format="¥%d", disabled=True)
+                    elif col in ("最適ウェイト（%）","リスク寄与（%）"):
+                        cfg[col] = st.column_config.NumberColumn(col, format="%.2f", disabled=True)
+                    else:
+                        cfg[col] = st.column_config.TextColumn(col, disabled=True)
+                else:
+                    # 編集可能な数値列：範囲ヒントを付ける
+                    if "感応度" in col or "係数" in col:
+                        cfg[col] = st.column_config.NumberColumn(
+                            col, format="%.4f", step=0.001,
+                            min_value=-5.0, max_value=5.0)
+                    elif col in ("期待リターン（年率）","ボラティリティ（年率）"):
+                        cfg[col] = st.column_config.NumberColumn(
+                            col, format="%.4f", step=0.001,
+                            min_value=-0.5, max_value=1.0)
+                    elif col in ("シャープレシオ","ベータ"):
+                        cfg[col] = st.column_config.NumberColumn(
+                            col, format="%.3f", step=0.01)
+            return cfg
+
+        # ── タブ別エディタ ──────────────────────────────────────────────────
+        tA, tB, tC, tD, tE, tF, tG = st.tabs([
+            "📊 基本 + 株式Δ/Γ",
+            "📈 SABR/ボラサーフェス",
+            "💱 FX/Vanna-Volga",
+            "🏦 金利期間構造",
+            "💳 クレジット",
+            "🛢️ コモディティ",
+            "🌐 流動性/マクロ",
+        ])
+
+        edited_parts = {}  # タブごとの編集後DFを収集
+
+        def _render_editor(tab_ctx, cols: list, label: str, key_sfx: str):
+            with tab_ctx:
+                disp_cols = [c for c in cols if c in sort_base.columns]
+                st.caption(f"{label}  |  編集可能列: "
+                           f"{sum(1 for c in disp_cols if c not in LOCKED_COLS)}列 /"
+                           f" 読取専用: {sum(1 for c in disp_cols if c in LOCKED_COLS)}列")
+                edited = st.data_editor(
+                    sort_base[disp_cols],
+                    use_container_width=True,
+                    hide_index=True,
+                    num_rows="fixed",
+                    column_config=_build_col_cfg(disp_cols),
+                    key=f"editor_{key_sfx}",
+                )
+                return edited
+
+        ea = _render_editor(tA, base_cols + grp_A,
+                            "【A】株式デルタ・ガンマ・スタイル・セクター感応度（20因子）", "A")
+        eb = _render_editor(tB, base_cols[:4] + grp_B,
+                            "【B】SABR（α/β/ρ/ν）・IV期間構造・ボラスキュー（16因子）", "B")
+        ec = _render_editor(tC, base_cols[:4] + grp_C,
+                            "【C】FXデルタ・Vanna・Volga・RR/BF全テナー（18因子）", "C")
+        ed = _render_editor(tD, base_cols[:4] + grp_D,
+                            "【D】JGB金利（1M〜30Y全テナー）・カーブ形状・スワップションIV（18因子）", "D")
+        ee = _render_editor(tE, base_cols[:4] + grp_E,
+                            "【E】CDS・CDX・iTraxx・デフォルト相関（12因子）", "E")
+        ef = _render_editor(tF, base_cols[:4] + grp_F,
+                            "【F】原油期間構造・貴金属・産業金属・農産物・OVX（12因子）", "F")
+        eg = _render_editor(tG, base_cols[:4] + grp_G,
+                            "【G】Amihud流動性・マクロ（GDP/CPI/PMI）・センチメント（10因子）", "G")
+
+        # ── 変更の検出と反映ボタン ────────────────────────────────────────
+        st.divider()
+        ca, cb, cc = st.columns([2, 2, 1])
+
+        with ca:
+            apply_btn = st.button("✅ 変更をポートフォリオに反映する",
+                                  type="primary", use_container_width=True)
+        with cb:
+            reset_btn = st.button("🔄 変更をリセット（最適化結果に戻す）",
+                                  use_container_width=True)
+        with cc:
+            show_diff = st.toggle("差分を表示", value=True)
+
+        if apply_btn:
+            # 全タブの編集結果をマージ（コードをキーに左結合）
+            merged = sort_base.copy()
+            for edited_tab, tab_cols in [
+                (ea, base_cols + grp_A),
+                (eb, base_cols[:4] + grp_B),
+                (ec, base_cols[:4] + grp_C),
+                (ed, base_cols[:4] + grp_D),
+                (ee, base_cols[:4] + grp_E),
+                (ef, base_cols[:4] + grp_F),
+                (eg, base_cols[:4] + grp_G),
+            ]:
+                editable_in_tab = [c for c in tab_cols
+                                   if c in edited_tab.columns and c not in LOCKED_COLS]
+                if editable_in_tab:
+                    merged[editable_in_tab] = edited_tab[editable_in_tab].values
+
+            # 変更差分を計算
+            diff_log = []
+            original = sort_base
+            for col in ALL_EDITABLE_COLS:
+                if col not in merged.columns or col not in original.columns:
+                    continue
+                changed_rows = merged[col].round(6) != original[col].round(6)
+                for idx in merged.index[changed_rows]:
+                    code = merged.loc[idx, "コード"] if "コード" in merged.columns else str(idx)
+                    name = merged.loc[idx, "銘柄名"] if "銘柄名" in merged.columns else ""
+                    old_v = original.loc[idx, col]
+                    new_v = merged.loc[idx, col]
+                    diff_log.append({
+                        "銘柄コード": code, "銘柄名": name,
+                        "変更列": col,
+                        "変更前": round(float(old_v), 6),
+                        "変更後": round(float(new_v), 6),
+                        "変更幅": round(float(new_v) - float(old_v), 6),
+                        "変更日時": datetime.now().strftime("%H:%M:%S"),
+                    })
+
+            if diff_log:
+                # session state に保存
+                st.session_state.portfolio_override = merged
+                st.session_state.opt_result["df_sel"] = merged  # RST計算に即反映
+                st.session_state.edit_history = (
+                    (st.session_state.edit_history or []) + diff_log
+                )
+                st.session_state.rst_result = None  # RST結果をリセット
+                st.success(f"✅ {len(diff_log)}件の変更を反映しました。RST結果はリセットされました。")
+                st.rerun()
+            else:
+                st.info("変更が検出されませんでした。")
+
+        if reset_btn:
+            st.session_state.portfolio_override = None
+            st.session_state.edit_history = []
+            # opt_result の df_sel を元の build_universe ベースに戻す
+            original_df = st.session_state.universe_df
+            if original_df is not None and st.session_state.opt_result is not None:
+                sel_idx = st.session_state.opt_result.get("sel_idx")
+                if sel_idx is not None:
+                    base_restored = original_df.iloc[sel_idx].reset_index(drop=True)
+                    # ウェイト・投資金額等を保持
+                    for keep_col in ["最適ウェイト（%）","投資金額（円）","推定口数","リスク寄与（%）"]:
+                        if keep_col in df_drill_full.columns:
+                            base_restored[keep_col] = df_drill_full[keep_col].values
+                    st.session_state.opt_result["df_sel"] = base_restored
+            st.session_state.rst_result = None
+            st.success("🔄 変更をリセットしました。")
+            st.rerun()
+
+        # ── 差分テーブル ────────────────────────────────────────────────
+        if show_diff and st.session_state.edit_history:
+            st.subheader("📋 変更履歴ログ")
+            hist_df = pd.DataFrame(st.session_state.edit_history)
+            # 正負で色分け（delta列）
+            st.dataframe(
+                hist_df,
+                use_container_width=True,
+                hide_index=True,
+                column_config={
+                    "変更前":  st.column_config.NumberColumn(format="%.4f"),
+                    "変更後":  st.column_config.NumberColumn(format="%.4f"),
+                    "変更幅":  st.column_config.NumberColumn(format="%.4f"),
+                },
+            )
+            # 列別・銘柄別 変更サマリー
+            if len(hist_df) > 1:
+                st.caption("**変更列ランキング（変更回数）**")
+                col_rank = hist_df.groupby("変更列").size().sort_values(ascending=False).head(10)
+                st.bar_chart(col_rank)
+
+    st.divider()
+
+    # ══ LAYER 5: バックテスト ════════════════════════════════════════════════
+    st.markdown('<div class="sec-hdr slate">📈 LAYER 5 — バックテスト & リターン分布</div>', unsafe_allow_html=True)
+
+    port_daily  = r["rm_sel"] @ w
+    bench_daily = r["rm_sel"] @ (np.ones(len(w))/len(w))
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        cum  = np.cumprod(1 + port_daily)
+        bcum = np.cumprod(1 + bench_daily)
+        fig_cum = go.Figure()
+        fig_cum.add_trace(go.Scatter(y=cum,  mode="lines", name="最適PF", line=dict(color="#1d4ed8", width=2)))
+        fig_cum.add_trace(go.Scatter(y=bcum, mode="lines", name="等ウェイトベンチ", line=dict(color="#ffffff", dash="dash")))
+        fig_cum.update_layout(title="累積リターン推移", height=280, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(5,13,26,0.6)", font=dict(color="#ffffff"),
+                               yaxis_title="累積倍率", xaxis_title="営業日")
+        st.plotly_chart(fig_cum, use_container_width=True)
+    with c2:
+        fig_hist = go.Figure()
+        fig_hist.add_trace(go.Histogram(x=port_daily, nbinsx=50, name="日次リターン",
+                                         marker_color="#1d4ed8", opacity=0.7))
+        fig_hist.add_vline(x=-r["port_var"], line_dash="dash", line_color="orange",
+                            annotation_text=f"VaR {r['port_var']*100:.2f}%")
+        fig_hist.add_vline(x=-r["port_cvar"], line_dash="dot", line_color="red",
+                            annotation_text=f"CVaR {r['port_cvar']*100:.2f}%")
+        fig_hist.update_layout(title="日次リターン分布", height=280, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(5,13,26,0.6)", font=dict(color="#ffffff"), xaxis=dict(gridcolor="rgba(255,255,255,0.05)"), yaxis=dict(gridcolor="rgba(255,255,255,0.05)"))
+        st.plotly_chart(fig_hist, use_container_width=True)
+    with c3:
+        # ローリングボラティリティ（21日）
+        roll_vol = pd.Series(port_daily).rolling(21).std() * np.sqrt(252) * 100
+        fig_rvol = go.Figure()
+        fig_rvol.add_trace(go.Scatter(y=roll_vol.values, mode="lines",
+                                       line=dict(color="#d97706", width=1.5)))
+        fig_rvol.add_hline(y=r["port_vol"]*100, line_dash="dash", line_color="#1d4ed8",
+                            annotation_text=f"平均ボラ {r['port_vol']*100:.1f}%")
+        fig_rvol.update_layout(title="ローリングボラティリティ（21日）", height=280, paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(5,13,26,0.6)", font=dict(color="#ffffff"),
+                                yaxis_title="年率換算ボラ（%）")
+        st.plotly_chart(fig_rvol, use_container_width=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 5 ── リバースストレステスト
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "🔍 リバースストレステスト":
+    st.title("🔍 リバースストレステスト")
+    st.markdown("##### 最悪シナリオの自動発見 × 想定外シナリオ発掘 × 量子vs古典比較")
+
+    if st.session_state.opt_result is None:
+        st.warning("⚠️ 先に「量子最適化実行」を完了してください。")
+        st.stop()
+
+    r   = st.session_state.opt_result
+    df  = r["df_sel"]
+    w   = r["weights"]
+    aum = st.session_state.aum
+
+    # ── RST必要性判定パネル ──────────────────────────────────────────────────
+    n_space = N_RST_LEVELS ** N_RST_FACTORS
+    st.markdown('<div class="sec-hdr purple">⚛️ 量子アニーリング 必要性判定</div>', unsafe_allow_html=True)
+
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        st.markdown(f"""<div class="kpi-card info">
+        <div class="kpi-title">⚛️ 探索空間</div>
+        <div class="kpi-value" style="font-size:1.2rem">7¹⁸ ≈ 1.6兆</div>
+        <div class="kpi-sub">{N_RST_FACTORS}ファクター × {N_RST_LEVELS}水準</div></div>""",
+        unsafe_allow_html=True)
+    with c2:
+        st.markdown(f"""<div class="kpi-card danger">
+        <div class="kpi-title">⚡ 古典全列挙の所要時間</div>
+        <div class="kpi-value" style="font-size:1.2rem">~1,600年</div>
+        <div class="kpi-sub">全列挙は物理的に不可能 → 量子が必須</div></div>""",
+        unsafe_allow_html=True)
+    with c3:
+        st.markdown(f"""<div class="kpi-card info">
+        <div class="kpi-title">🔀 クロスガンマ相関</div>
+        <div class="kpi-value" style="font-size:1.2rem">あり（非線形）</div>
+        <div class="kpi-sub">株式Γ・FX×株クロスΓ・株×金利クロスΓ含む</div></div>""",
+        unsafe_allow_html=True)
+
+    # 量子必要性の正直な評価
+    st.markdown("""
+    <div class="alert-info">
+    <b>⚛️ 量子アニーリングの本当の価値（このユースケースでの評価）</b><br><br>
+    <span class="quantum-badge badge-required">⚛️ 量子が必須</span> <b>探索空間：</b>
+    18ファクター×7水準 = 7¹⁸ ≈ 1.6兆通り。古典コンピュータでの全列挙は事実上不可能。<br>
+    <span class="quantum-badge badge-required">⚛️ 量子が有利</span> <b>非線形リスク：</b>
+    ガンマ・クロスガンマ項が加わることで局所最適が爆発的に増加し、古典SAの品質が急速に低下する。<br>
+    <span class="quantum-badge badge-optional">🔍 注意：</span> <b>ハードウェア制約：</b>
+    実際のAmplify AEでは問題規模に応じた変数割り当てが必要。大規模問題は埋め込み最適化が鍵。
+    </div>""", unsafe_allow_html=True)
+
+    st.divider()
+
+    # ── 実行設定 ─────────────────────────────────────────────────────────────
+    st.markdown('<div class="sec-hdr amber">⚙️ RST実行設定</div>', unsafe_allow_html=True)
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        loss_threshold_pct = st.slider("損失アラート閾値（AUM比）[%]", 0.1, 5.0, 1.0, 0.1)
+        loss_threshold = aum * loss_threshold_pct / 100 / 1e6  # 百万円
+    with c2:
+        run_classical  = st.checkbox("古典比較も同時実行", value=True)
+        n_sa_iter      = st.slider("SA反復回数", 500, 5000, 1000, 500,
+                                    help="模擬焼きなまし法の反復数")
+    with c3:
+        run_qa = st.checkbox("量子AE（要Amplifyトークン）",
+                              value=bool(st.session_state.amplify_token))
+
+    run_rst = st.button("🚀 RST実行（全手法）", type="primary", use_container_width=True)
+
+    if run_rst:
+        prog = st.progress(0); status = st.empty()
+        rst_results = {}
+
+        # ① ランダム探索
+        if run_classical:
+            status.info("🎲 ランダム探索実行中...")
+            prog.progress(5)
+            rs_idx, rs_pnl, rs_t, rs_hist = rst_random(w, df, aum, n_iter=n_sa_iter)
+            rst_results["ランダム探索"] = {
+                "idx": rs_idx, "pnl": rs_pnl, "time": rs_t, "history": rs_hist,
+                "label": "ランダム探索", "color": "#ffffff", "icon": "🎲",
+            }
+            prog.progress(20)
+
+        # ② 貪欲法（座標降下）
+        if run_classical:
+            status.info("📋 貪欲法（座標降下）実行中...")
+            prog.progress(25)
+            g_idx, g_pnl, g_t = rst_greedy(w, df, aum)
+            rst_results["貪欲法"] = {
+                "idx": g_idx, "pnl": g_pnl, "time": g_t, "history": None,
+                "label": "貪欲法（座標降下）", "color": "#22c55e", "icon": "📋",
+            }
+            prog.progress(40)
+
+        # ③ SA
+        if run_classical:
+            status.info("🌡️ 模擬焼きなまし法実行中...")
+            prog.progress(45)
+            sa_idx, sa_pnl, sa_t, sa_hist = rst_sa(w, df, aum)
+            rst_results["模擬焼きなまし法"] = {
+                "idx": sa_idx, "pnl": sa_pnl, "time": sa_t, "history": sa_hist,
+                "label": "模擬焼きなまし法 (SA)", "color": "#f97316", "icon": "🌡️",
+            }
+            prog.progress(65)
+
+        # ④ 量子AE
+        if run_qa and st.session_state.amplify_token:
+            status.info("⚛️ 量子アニーリング（Amplify AE）実行中...")
+            prog.progress(68)
+            try:
+                gen_var = VariableGenerator()
+                q_var = gen_var.array("Binary", N_RST_FACTORS, N_RST_LEVELS)
+
+                # PnL係数を計算してQUBO構築
+                coef_lin = np.zeros((N_RST_FACTORS, N_RST_LEVELS))
+                for j in range(N_RST_FACTORS):
+                    for l in range(N_RST_LEVELS):
+                        tmp = [3]*N_RST_FACTORS; tmp[j] = l
+                        pnl_j, _ = calc_rst_pnl(tmp, w, df, aum)
+                        coef_lin[j, l] = pnl_j
+
+                max_abs = max(abs(coef_lin).max(), 1.0)
+                SCALE   = max_abs / 50.0
+                LAMBDA  = 150.0
+
+                H = asum(float(coef_lin[j, l] / SCALE) * q_var[j, l]
+                          for j in range(N_RST_FACTORS) for l in range(N_RST_LEVELS))
+                for j in range(N_RST_FACTORS):
+                    s = asum(q_var[j, l] for l in range(N_RST_LEVELS))
+                    H += LAMBDA * (s - 1) * (s - 1)
+
+                client = FixstarsClient()
+                client.token = st.session_state.amplify_token
+                client.parameters.timeout = timedelta(seconds=5.0)
+                t0_qa = time.perf_counter()
+                result_qa = solve(Model(H), client)
+                qa_t = time.perf_counter() - t0_qa
+
+                qa_idx = np.array([3]*N_RST_FACTORS, dtype=int)
+                if len(result_qa) > 0:
+                    qv = q_var.evaluate(result_qa.best.values)
+                    for j in range(N_RST_FACTORS):
+                        assigned = [l for l in range(N_RST_LEVELS) if qv[j][l] == 1]
+                        qa_idx[j] = assigned[0] if len(assigned) == 1 else \
+                            int(np.argmin(coef_lin[j]))
+                qa_pnl, _ = calc_rst_pnl(qa_idx, w, df, aum)
+                rst_results["量子アニーリング"] = {
+                    "idx": qa_idx, "pnl": qa_pnl, "time": qa_t, "history": None,
+                    "label": "量子AE (Amplify)", "color": "#7c3aed", "icon": "⚛️",
+                }
+            except Exception as e:
+                st.warning(f"量子AEエラー: {e}")
+        elif st.session_state.rst_result is not None:
+            prev = st.session_state.rst_result
+            if "量子AE（前回）" in prev.get("results", {}):
+                rst_results["量子AE（前回）"] = prev["results"]["量子AE（前回）"]
+        prog.progress(90)
+
+        # シナリオ分類
+        for name, res in rst_results.items():
+            top_sc = classify_scenario(res["idx"])
+            res["top_scenarios"] = top_sc
+            res["is_unexpected"] = not is_conventional_scenario(res["idx"])
+            _, res["pnl_by_factor"] = calc_rst_pnl(res["idx"], w, df, aum)
+
+        prog.progress(100)
+        status.success("✅ RST完了！結果を確認してください。")
+        st.session_state.rst_result = {
+            "results": rst_results,
+            "loss_threshold": loss_threshold,
+        }
+
+    # ── 結果表示 ─────────────────────────────────────────────────────────────
+    rst = st.session_state.rst_result
+    if rst is None:
+        st.info("👆 上の「RST実行（全手法）」ボタンを押すと結果が表示されます。")
+        st.markdown('<div class="sec-hdr slate">📖 RST概要</div>', unsafe_allow_html=True)
+        st.markdown("""
+        **リバースストレステストとは：**
+        「損失X円を引き起こすシナリオはどれか？」を逆方向に探索するリスク管理手法です。
+        通常のストレステストが「このシナリオなら損失はいくら？」を問うのに対し、
+        RSTは「最大損失を引き起こす未知の組み合わせシナリオ」を自動発見します。
+
+        **トレーダーにとっての価値：**
+        - 「考えたこともなかったシナリオ」の発見
+        - ヘッジ戦略立案の前提としての最悪ケース把握
+        - リスク限度設定・VaR補完としての活用
+
+        **注意：** RSTは収益を上げるためのツールではなく損失限定のためのもの。
+        導入コスト正当化には規制対応・損失シナリオ管理の観点での評価が適切です。
+        """)
+        st.stop()
+
+    results = rst["results"]
+    threshold = rst["loss_threshold"]
+
+    # ══ サマリー: 手法別最悪損失 ══════════════════════════════════════════════
+    st.markdown('<div class="sec-hdr red">⚠️ 手法別最悪シナリオ損失（サマリー）</div>', unsafe_allow_html=True)
+
+    # 最悪損失カード
+    cols = st.columns(len(results))
+    for i, (name, res) in enumerate(results.items()):
+        pnl = res["pnl"]
+        cls = "danger" if pnl < -threshold else "warn" if pnl < 0 else "ok"
+        unexpected_badge = '<span class="unexpected-tag">想定外</span>' if res.get("is_unexpected") else '<span class="conventional-tag">想定内</span>'
+        cols[i].markdown(f"""<div class="kpi-card {cls}">
+        <div class="kpi-title">{res['icon']} {res['label']}</div>
+        <div class="kpi-value {'red' if pnl < 0 else 'grn'}" style="font-size:1.2rem">{pnl:+,.0f}</div>
+        <div class="kpi-sub">百万円 | {res['time']:.3f}秒</div>
+        <div style="margin-top:0.3rem">{unexpected_badge}</div>
+        </div>""", unsafe_allow_html=True)
+
+    # サマリーテーブル
+    sum_rows = []
+    for name, res in results.items():
+        sc_name = res["top_scenarios"][0][0] if res.get("top_scenarios") else "不明"
+        sum_rows.append({
+            "手法":          f"{res['icon']} {res['label']}",
+            "最悪損失（百万円）": int(res["pnl"]),
+            "計算時間（秒）": round(res["time"], 3),
+            "主要シナリオ":  sc_name,
+            "シナリオ種別":  "⚠️ 想定外" if res.get("is_unexpected") else "✅ 想定内",
+        })
+    st.dataframe(pd.DataFrame(sum_rows), use_container_width=True, hide_index=True,
+                 column_config={
+                     "最悪損失（百万円）": st.column_config.NumberColumn(format="%d"),
+                 })
+
+    st.divider()
+
+    # ══ タブ: シナリオ詳細 ════════════════════════════════════════════════════
+    tab1, tab2, tab3, tab4 = st.tabs([
+        "🎯 最悪シナリオ詳細",
+        "🌏 シナリオ経済解釈",
+        "📊 P&L ブレイクダウン",
+        "🔬 量子vs古典 比較",
+    ])
+
+    # ── TAB 1: 最悪シナリオ詳細 ──────────────────────────────────────────────
+    with tab1:
+        # 最悪手法の特定
+        worst_key = min(results, key=lambda k: results[k]["pnl"])
+        worst_res = results[worst_key]
+
+        st.markdown(f'<div class="sec-hdr red">🔴 最悪シナリオ（{worst_res["icon"]} {worst_res["label"]}）</div>', unsafe_allow_html=True)
+
+        if worst_res.get("is_unexpected"):
+            st.markdown("""<div class="alert-err">
+            ⚠️ <b>想定外シナリオが発見されました。</b>
+            単一ファクター分析では見落とされる複合シナリオです。トレーダーへの即時共有を推奨します。
+            </div>""", unsafe_allow_html=True)
+        else:
+            st.markdown("""<div class="alert-warn">
+            📋 このシナリオは従来の感応度分析でも想定可能な範囲です。
+            </div>""", unsafe_allow_html=True)
+
+        # シナリオファクター詳細
+        sc_rows = []
+        for j, fac in enumerate(RST_FACTORS):
+            l     = int(worst_res["idx"][j])
+            move  = fac["levels"][l]
+            sc_rows.append({
+                "マーケットファクター": fac["name"],
+                "変化量": move,
+                "単位": fac["unit"],
+                "水準": f"L{l+1}",
+                "水準強度": f"{'極端' if abs(move) == max(abs(v) for v in fac['levels']) else '中程度' if abs(move) > 0 else 'ゼロ'}",
+            })
+        df_sc = pd.DataFrame(sc_rows)
+
+        c1, c2 = st.columns([1.2, 1])
+        with c1:
+            # レーダーチャート
+            norms = []
+            for j, fac in enumerate(RST_FACTORS):
+                l = int(worst_res["idx"][j])
+                mv = fac["levels"][l]
+                max_abs = max(abs(v) for v in fac["levels"])
+                norms.append(mv / (max_abs + 1e-9) * 100)
+            cats = [f["name"] for f in RST_FACTORS]
+            fig_radar = go.Figure()
+            fig_radar.add_trace(go.Scatterpolar(
+                r=norms + [norms[0]], theta=cats + [cats[0]],
+                fill="toself", fillcolor="rgba(220,38,38,0.15)",
+                line=dict(color="#dc2626", width=2),
+                name="最悪シナリオ",
+            ))
+            fig_radar.add_trace(go.Scatterpolar(
+                r=[0]*7, theta=cats + [cats[0]],
+                line=dict(color="#ccc", width=1),
+                name="現状（ゼロ）",
+            ))
+            fig_radar.update_layout(
+                polar=dict(radialaxis=dict(visible=True, range=[-110, 110])),
+                title="🔴 最悪シナリオ ファクター分布", height=360,
+            )
+            st.plotly_chart(fig_radar, use_container_width=True)
+        with c2:
+            st.dataframe(df_sc, use_container_width=True, hide_index=True)
+            st.markdown(f"""<div class="kpi-card danger">
+            <div class="kpi-title">⚠️ 最悪シナリオ損失</div>
+            <div class="kpi-value red">{worst_res['pnl']:+,.0f}</div>
+            <div class="kpi-sub">百万円（AUM比 {abs(worst_res['pnl'])/(aum/1e6)*100:.2f}%）</div>
+            </div>""", unsafe_allow_html=True)
+            pnl_threshold = -threshold
+            if worst_res["pnl"] < pnl_threshold:
+                st.markdown(f'<div class="alert-err">🚨 損失アラート閾値（{threshold:,.0f}百万円）を超過</div>', unsafe_allow_html=True)
+
+    # ── TAB 2: シナリオ経済解釈 ───────────────────────────────────────────────
+    with tab2:
+        st.markdown('<div class="sec-hdr amber">🌏 シナリオの経済的背景とトレーダーノート</div>', unsafe_allow_html=True)
+
+        worst_key = min(results, key=lambda k: results[k]["pnl"])
+        worst_res = results[worst_key]
+        top_sc = worst_res.get("top_scenarios", [])
+
+        if top_sc:
+            primary = top_sc[0]
+            sc_info = primary[2]
+            sc_color = SCENARIO_LIBRARY.get(primary[0], {}).get("color", "#dc2626") if primary[0] in SCENARIO_LIBRARY else "#dc2626"
+
+            # メインシナリオカード
+            st.markdown(f"""
+            <div style="background:rgba(10,22,40,0.9);border:2px solid {sc_color};border-radius:10px;
+            padding:1.2rem 1.5rem;margin-bottom:1rem;color:#e2e8f0;">
+            <h3 style="margin:0 0 0.5rem 0;color:{sc_color};font-size:1.1rem;">
+            📌 主要シナリオ：{primary[0]}</h3>
+            <p style="color:#94a3b8;font-size:0.85rem;margin:0;">
+            シナリオ類似度スコア: {primary[1]*100:.0f}% |
+            {"⚠️ 想定外シナリオ（複合危機）" if worst_res.get("is_unexpected") else "✅ 想定内シナリオ"}
+            </p>
+            </div>""", unsafe_allow_html=True)
+
+            # ── 経済的背景（概要）────────────────────────────────────────
+            st.markdown("**📖 経済的背景（概要）：**")
+            st.markdown(sc_info.get("desc", ""))
+
+            c1, c2, c3 = st.columns(3)
+            _box_style = "background:rgba(255,255,255,0.03);border:1px solid rgba(255,255,255,0.08);border-radius:10px;padding:0.85rem 1.1rem;margin:0.3rem 0;font-size:0.83rem;color:#e2e8f0;"
+            c1.markdown(f"""<div style="{_box_style}">
+            <b style="color:#e2e8f0;">発生確率の目安</b><br>{sc_info.get('prob','—')}
+            </div>""", unsafe_allow_html=True)
+            c2.markdown(f"""<div style="{_box_style}">
+            <b style="color:#e2e8f0;">参考過去事例</b><br>{sc_info.get('hist','—')}
+            </div>""", unsafe_allow_html=True)
+            c3.markdown(f"""<div style="background:rgba(253,211,77,0.08);border:1px solid #fcd34d;border-radius:10px;padding:0.85rem 1.1rem;margin:0.3rem 0;font-size:0.83rem;color:#e2e8f0;">
+            <b style="color:#fcd34d;">🎯 トレーダーノート</b><br>{sc_info.get('trader_note','—')}
+            </div>""", unsafe_allow_html=True)
+
+            # ── ギリシャ文字リスク詳細（デルタ・ガンマ・ベガ）─────────────────
+            st.markdown('<div class="sec-hdr amber">🔢 リスクファクター別 経済的インパクト詳細</div>', unsafe_allow_html=True)
+
+            tab_d, tab_g, tab_v, tab_c, tab_r, tab_path, tab_hedge = st.tabs([
+                "Δ デルタリスク", "Γ ガンマリスク", "ν ベガリスク",
+                "💳 クレジットリスク", "🏛️ 規制インパクト", "🔗 伝播経路", "🛡️ ヘッジ戦略",
+            ])
+
+            def _render_impact_lines(key: str, sc: dict, empty_msg: str):
+                """impactフィールドを行ごとに st.write で安全描画"""
+                text = sc.get(key, "")
+                if text:
+                    for line in text.strip().split("\n"):
+                        line = line.strip()
+                        if line:
+                            st.write(line)
+                else:
+                    st.write(empty_msg)
+
+            with tab_d:
+                st.markdown("**📊 デルタ（Δ）：線形リスク感応度**")
+                st.info("各ファクターの1単位変化に対するポートフォリオの線形（一次）感応度です。")
+                _render_impact_lines("delta_impact", sc_info, "デルタ情報はありません。")
+
+            with tab_g:
+                st.markdown("**📈 ガンマ（Γ）：非線形リスク・クロスガンマ**")
+                st.warning("ガンマリスクはデルタだけでは捉えられない急落時の加速・交差リスクです。")
+                _render_impact_lines("gamma_impact", sc_info, "ガンマ情報はありません。")
+
+            with tab_v:
+                st.markdown("**📉 ベガ（ν）：ボラティリティリスク**")
+                st.info("VIX・インプライドボラティリティの変化がポートフォリオに与える影響です。")
+                _render_impact_lines("vega_impact", sc_info, "ベガ情報はありません。")
+
+            with tab_c:
+                st.markdown("**💳 クレジットリスク：スプレッド拡大・デフォルト波及**")
+                st.error("クレジットスプレッドの拡大は企業債務コストを直撃し流動性危機につながります。")
+                _render_impact_lines("credit_impact", sc_info, "クレジット情報はありません。")
+
+            with tab_r:
+                st.markdown("**🏛️ 規制インパクト（Basel III / FRTB / IRRBB）**")
+                st.info("バーゼルIII規制指標（VaR・LCR・NSFR・資本比率）への影響を示します。")
+                _render_impact_lines("regulatory", sc_info, "規制情報はありません。")
+
+            with tab_path:
+                st.markdown("**🔗 リスク伝播経路（コンテイジョン・パス）**")
+                st.warning("リスクがどのように他市場・他セクターに波及するかを示します。")
+                contagion = sc_info.get("contagion", "")
+                if contagion:
+                    steps = [s.strip() for s in contagion.strip().split("→") if s.strip()]
+                    # st.write でステップをテキスト形式で安全描画
+                    st.write(" → ".join(steps))
+                else:
+                    st.write("伝播経路情報はありません。")
+
+            with tab_hedge:
+                st.markdown("**🛡️ ヘッジ戦略推奨（優先度別）**")
+                st.success("以下は本シナリオが実現した場合の推奨ヘッジアクションです。")
+                hedge_dict = sc_info.get("hedge", {})
+                if hedge_dict:
+                    hedge_df = pd.DataFrame([
+                        {"優先度・カテゴリ": k, "推奨ヘッジ手段・注意事項": v}
+                        for k, v in hedge_dict.items()
+                    ])
+                    st.dataframe(hedge_df, use_container_width=True, hide_index=True)
+                else:
+                    st.write("このシナリオのヘッジ情報は準備中です。")
+
+            # ── 上位3シナリオ分類（ネイティブ st.dataframe で安全描画）──────────
+            st.subheader("🏷️ シナリオ分類（上位3候補）")
+            sc_rows = []
+            for sc_name, sim, sc_info_i in top_sc:
+                is_primary = (sc_name == top_sc[0][0])
+                sc_rows.append({
+                    "順位":       "⭐ 主要" if is_primary else f"  #{top_sc.index((sc_name,sim,sc_info_i))+1}",
+                    "シナリオ名": sc_name,
+                    "類似度":    f"{sim*100:.0f}%",
+                    "発生確率":  sc_info_i.get("prob", "—"),
+                    "参考事例":  sc_info_i.get("hist", "—")[:40] + "…"
+                                 if len(sc_info_i.get("hist","")) > 40 else sc_info_i.get("hist","—"),
+                })
+            st.dataframe(pd.DataFrame(sc_rows), use_container_width=True, hide_index=True)
+
+        # 全シナリオライブラリ比較
+        st.markdown('<div class="sec-hdr slate">📚 全シナリオライブラリ対比</div>', unsafe_allow_html=True)
+        all_scores = classify_scenario(worst_res["idx"], top_n=len(SCENARIO_LIBRARY))
+        fig_all = go.Figure(go.Bar(
+            x=[s for s,_,_ in all_scores],
+            y=[sim*100 for _,sim,_ in all_scores],
+            marker_color=[SCENARIO_LIBRARY.get(s,{}).get("color","#ffffff") for s,_,_ in all_scores],
+            text=[f"{sim*100:.0f}%" for _,sim,_ in all_scores],
+            textposition="outside",
+        ))
+        fig_all.update_layout(title="各シナリオテンプレートとの類似度（%）", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(5,13,26,0.6)", font=dict(color="#ffffff"),
+                               yaxis_title="類似度（%）",
+                               xaxis={"tickangle": -20}, height=340)
+        st.plotly_chart(fig_all, use_container_width=True)
+
+        # シナリオ別詳細アコーディオン（全フィールド表示）
+        st.markdown("**🗂️ 各シナリオの詳細説明（クリックして展開）**")
+        for sc_name, sim, sc_info_i in all_scores[:5]:
+            with st.expander(f"{sc_name}（類似度 {sim*100:.0f}%）"):
+                rows = []
+                for field, label in [
+                    ("prob",          "発生確率"),
+                    ("hist",          "参考事例"),
+                    ("desc",          "概要"),
+                    ("delta_impact",  "📊 デルタリスク（Δ）"),
+                    ("gamma_impact",  "📈 ガンマリスク（Γ）"),
+                    ("vega_impact",   "📉 ベガリスク（ν）"),
+                    ("credit_impact", "💳 クレジットリスク"),
+                    ("regulatory",    "🏛️ 規制インパクト"),
+                    ("trader_note",   "🎯 トレーダーノート"),
+                ]:
+                    val = sc_info_i.get(field, "")
+                    if val:
+                        rows.append({"項目": label, "内容": val})
+                if rows:
+                    st.dataframe(pd.DataFrame(rows), use_container_width=True, hide_index=True)
+                # ヘッジ戦略
+                hedge = sc_info_i.get("hedge", {})
+                if hedge:
+                    st.markdown("**🛡️ ヘッジ戦略：**")
+                    hedge_rows = [{"優先度・カテゴリ": k, "推奨手段": v}
+                                  for k, v in hedge.items()]
+                    st.dataframe(pd.DataFrame(hedge_rows),
+                                 use_container_width=True, hide_index=True)
+
+    # ── TAB 3: P&L ブレイクダウン ─────────────────────────────────────────────
+    with tab3:
+        st.markdown('<div class="sec-hdr red">📊 最悪シナリオ P&L ブレイクダウン（手法別比較）</div>', unsafe_allow_html=True)
+
+        worst_key = min(results, key=lambda k: results[k]["pnl"])
+
+        # 手法選択
+        sel_method = st.selectbox("表示する手法を選択",
+                                   list(results.keys()), index=list(results.keys()).index(worst_key))
+        res_sel = results[sel_method]
+        pnl_by_fac = res_sel["pnl_by_factor"]
+        df_pnl = pd.DataFrame(pnl_by_fac)
+
+        c1, c2 = st.columns(2)
+        with c1:
+            # P&Lウォーターフォール
+            fig_wf = go.Figure(go.Waterfall(
+                orientation="v",
+                measure=["relative"]*N_RST_FACTORS + ["total"],
+                x=[p["ファクター"] for p in pnl_by_fac] + ["合計損失"],
+                y=[p["PnL（百万円）"] for p in pnl_by_fac] + [0],
+                text=[f"{p['PnL（百万円）']:+.0f}" for p in pnl_by_fac] + [f"{res_sel['pnl']:+.0f}"],
+                textposition="outside",
+                connector={"line": {"color": "#e5e7eb"}},
+                increasing={"marker": {"color": "#059669"}},
+                decreasing={"marker": {"color": "#dc2626"}},
+                totals={"marker": {"color": "#d97706"}},
+            ))
+            fig_wf.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(5,13,26,0.6)", font=dict(color="#ffffff"),
+                title=f"P&Lウォーターフォール（{res_sel['label']}）",
+                yaxis_title="百万円", height=360,
+            )
+            st.plotly_chart(fig_wf, use_container_width=True)
+        with c2:
+            # ファクター別P&L棒グラフ
+            colors_pnl = [RST_FACTORS[j]["color"] if df_pnl.iloc[j]["PnL（百万円）"] >= 0
+                          else "#dc2626" for j in range(len(df_pnl))]
+            fig_bar = go.Figure(go.Bar(
+                x=df_pnl["ファクター"], y=df_pnl["PnL（百万円）"],
+                marker_color=colors_pnl,
+                text=[f"{v:+.0f}" for v in df_pnl["PnL（百万円）"]],
+                textposition="outside",
+            ))
+            fig_bar.add_hline(y=0, line_color="#999", line_width=1)
+            fig_bar.update_layout(title="ファクター別P&L貢献（百万円）", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(5,13,26,0.6)", font=dict(color="#ffffff"),
+                                   yaxis_title="百万円", height=360,
+                                   xaxis={"tickangle": -20})
+            st.plotly_chart(fig_bar, use_container_width=True)
+
+        # 詳細テーブル
+        st.dataframe(df_pnl.sort_values("PnL（百万円）"),
+                     use_container_width=True, hide_index=True,
+                     column_config={
+                         "PnL（百万円）": st.column_config.NumberColumn(format="%.1f"),
+                     })
+
+        # セクター別損失ブレイクダウン
+        st.markdown('<div class="sec-hdr red">🏭 セクター別損失ブレイクダウン（最悪シナリオ）</div>', unsafe_allow_html=True)
+        # 最悪シナリオ時のセクター別損失
+        moves_worst = {RST_FACTORS[j]["name"]: RST_FACTORS[j]["levels"][int(res_sel["idx"][j])]
+                       for j in range(N_RST_FACTORS)}
+
+        sector_pnl = {}
+        for _, row in df.iterrows():
+            sec = row["セクター"]
+            wi  = row["最適ウェイト（%）"] / 100
+            # TOPIX感応度による損失
+            topix_move = moves_worst.get("TOPIX変化率", 0)
+            pnl_stock  = wi * row["TOPIX感応度"] * (topix_move / 100) * aum / 1e6
+            sector_pnl[sec] = sector_pnl.get(sec, 0) + pnl_stock
+
+        df_sec_pnl = pd.DataFrame([{"セクター": k, "推定損益（百万円）": round(v, 1)}
+                                    for k, v in sorted(sector_pnl.items(), key=lambda x: x[1])])
+        fig_sec_pnl = go.Figure(go.Bar(
+            x=df_sec_pnl["推定損益（百万円）"],
+            y=df_sec_pnl["セクター"],
+            orientation="h",
+            marker_color=["#dc2626" if v < 0 else "#059669"
+                          for v in df_sec_pnl["推定損益（百万円）"]],
+            text=[f"{v:+.0f}" for v in df_sec_pnl["推定損益（百万円）"]],
+            textposition="outside",
+        ))
+        fig_sec_pnl.update_layout(title="セクター別 推定損益（TOPIX感応度ベース）", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(5,13,26,0.6)", font=dict(color="#ffffff"),
+                                   xaxis_title="百万円", height=360)
+        st.plotly_chart(fig_sec_pnl, use_container_width=True)
+
+    # ── TAB 4: 量子vs古典 ─────────────────────────────────────────────────────
+    with tab4:
+        st.markdown('<div class="sec-hdr purple">🔬 量子アニーリング vs 古典最適化 比較</div>', unsafe_allow_html=True)
+
+        qa_key = next((k for k in results if "量子" in k), None)
+
+        # 総合比較棒グラフ
+        c1, c2 = st.columns(2)
+        with c1:
+            fig_comp = go.Figure()
+            for name, res in results.items():
+                fig_comp.add_trace(go.Bar(
+                    x=[res["label"]], y=[res["pnl"]],
+                    marker_color=res["color"],
+                    text=[f"{res['pnl']:,.0f}"], textposition="outside",
+                    name=res["label"],
+                ))
+            base_pnl = results.get("ランダム探索", list(results.values())[0])["pnl"]
+            fig_comp.add_hline(y=base_pnl, line_dash="dash", line_color="#ffffff",
+                                annotation_text="ランダム（基準）")
+            fig_comp.update_layout(paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(5,13,26,0.6)", font=dict(color="#ffffff"),
+                title="手法別 最悪損失PnL（低いほど多くの損失を発見）",
+                yaxis_title="最悪PnL（百万円）",
+                height=360, showlegend=False,
+            )
+            st.plotly_chart(fig_comp, use_container_width=True)
+        with c2:
+            fig_time = go.Figure()
+            for name, res in results.items():
+                fig_time.add_trace(go.Bar(
+                    x=[res["label"]], y=[res["time"]],
+                    marker_color=res["color"],
+                    text=[f"{res['time']:.3f}秒"], textposition="outside",
+                    name=res["label"],
+                ))
+            fig_time.update_layout(title="計算時間比較（秒）", paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(5,13,26,0.6)", font=dict(color="#ffffff"),
+                                    yaxis_title="秒", height=360, showlegend=False)
+            st.plotly_chart(fig_time, use_container_width=True)
+
+        # 想定外シナリオ発見の比較
+        st.markdown('<div class="sec-hdr purple">💡 「想定外シナリオ」の発見能力比較</div>', unsafe_allow_html=True)
+        discovery_rows = []
+        for name, res in results.items():
+            discovery_rows.append({
+                "手法":         f"{res['icon']} {res['label']}",
+                "最悪損失":     f"{res['pnl']:+,.0f}百万円",
+                "計算時間":     f"{res['time']:.3f}秒",
+                "シナリオ種別": "⚠️ 想定外" if res.get("is_unexpected") else "✅ 想定内",
+                "主要シナリオ": res.get("top_scenarios", [{}])[0][0] if res.get("top_scenarios") else "—",
+                "量子vs古典":  "⚛️ 量子" if "量子" in name else "🖥️ 古典",
+            })
+        st.dataframe(pd.DataFrame(discovery_rows), use_container_width=True, hide_index=True)
+
+        # 量子優位性評価
+        if qa_key:
+            qa_res   = results[qa_key]
+            best_cl_key = min([k for k in results if k != qa_key and "量子" not in k],
+                               key=lambda k: results[k]["pnl"], default=None)
+            if best_cl_key:
+                best_cl  = results[best_cl_key]
+                adv_pnl  = best_cl["pnl"] - qa_res["pnl"]  # 負ならQAが多くの損失を発見
+                adv_pct  = adv_pnl / (abs(best_cl["pnl"]) + 1e-9) * 100
+
+                if adv_pnl < -5:
+                    v_color, verdict = "#7c3aed", "✅ 量子優位（想定外シナリオを追加発見）"
+                    vmsg = f"量子AEは最良古典手法より {abs(adv_pnl):.0f}百万円 大きな損失シナリオを発見しました。"
+                elif adv_pnl <= 0:
+                    v_color, verdict = "#d97706", "🟡 ほぼ同等（わずかな優位）"
+                    vmsg = "量子AEと古典手法の差は僅少です。SA反復数を増やすか、より複雑な問題設定で再評価することを推奨します。"
+                else:
+                    v_color, verdict = "#059669", "🟢 古典手法が優位（この試行では）"
+                    vmsg = ("18ファクター×7水準（7¹⁸≈1.6兆通り）のこの規模では、古典SAが今回の試行で良好な結果を出しています。"
+                            "タイムアウト延長・SAハイパーパラメータ調整により量子優位性が顕在化します。")
+
+                st.markdown(f"""
+                <div style="background:rgba(10,22,40,0.9);border:2px solid {v_color};border-radius:10px;
+                padding:1.2rem 1.5rem;margin:0.5rem 0;color:#e2e8f0;">
+                <h3 style="color:{v_color};margin:0 0 0.5rem 0;">{verdict}</h3>
+                <p style="color:#94a3b8;font-size:0.88rem;margin:0;">{vmsg}</p>
+                </div>""", unsafe_allow_html=True)
+        else:
+            # QA未実行 → 古典手法同士の比較まとめ
+            best_cl_key = min(results, key=lambda k: results[k]["pnl"])
+            best_cl = results[best_cl_key]
+            st.markdown(f"""
+            <div style="background:rgba(16,185,129,0.08);border:2px solid #059669;
+            border-radius:10px;padding:1.2rem 1.5rem;color:#e2e8f0;">
+            <h3 style="color:#059669;margin:0 0 0.5rem 0;">
+            🏆 古典手法最良: {best_cl['icon']} {best_cl['label']}</h3>
+            <p style="margin:0;font-size:0.88rem;color:#94a3b8;">
+            最悪損失: {best_cl['pnl']:,.0f}百万円 | 計算時間: {best_cl['time']:.3f}秒<br>
+            Amplify AEトークンを設定すると量子との比較も可能です。
+            </p></div>""", unsafe_allow_html=True)
+
+        # 量子必要性の最終評価
+        st.markdown('<div class="sec-hdr slate">⚖️ このポートフォリオへの量子RSTの費用対効果評価</div>', unsafe_allow_html=True)
+        eval_items = [
+            ("探索空間の大きさ",       f"7¹⁸ ≈ 1.6兆通り ({N_RST_FACTORS}F×{N_RST_LEVELS}L)",
+             "量子必須は10億通り以上が目安",
+             "⚛️ 量子が必須"),
+            ("非線形リスク（ガンマ）",  "株式Γ・クロスΓ（FX×株・株×金利）含む",
+             "ガンマ項あり→局所最適増加→古典SA品質急低下",
+             "⚛️ 量子が有効"),
+            ("リアルタイム性の必要度", "バッチ（日次実行）",
+             "日次バッチでも18Fなら量子が時間的にも有利",
+             "⚛️ 量子が優位"),
+            ("想定外シナリオ発見価値", "クロスガンマ・多重相関あり",
+             "複合シナリオ発見に量子が有効",
+             "⚛️ 量子が有効"),
+            ("規制・監査対応価値",     "Basel III FRTB・IRRBB・LCR",
+             "規制文書化・説明可能性に価値あり",
+             "⚛️ 要件次第で有効"),
+        ]
+        df_eval = pd.DataFrame(eval_items, columns=["評価項目","現状","評価基準","判定"])
+        st.dataframe(df_eval, use_container_width=True, hide_index=True)
+
+# ══════════════════════════════════════════════════════════════════════════════
+# PAGE 6 ── 運用レポート（unsafe_allow_html 排除版 ─ DOM競合エラー修正済み）
+# ══════════════════════════════════════════════════════════════════════════════
+elif page == "📋 運用レポート":
+    st.title("📋 運用レポート")
+
+    if st.session_state.opt_result is None:
+        st.warning("⚠️ 先に「量子最適化実行」を完了してください。")
+        st.stop()
+
+    r   = st.session_state.opt_result
+    df  = r["df_sel"]
+    now = datetime.now().strftime("%Y年%m月%d日 %H:%M")
+
+    # ── ヘッダー情報（ネイティブ table → st.dataframe で安全に描画）──────────
+    hdr_df = pd.DataFrame({
+        "項目": ["作成日時", "運用資産額（AUM）", "ベンチマーク",
+                  "運用スタイル", "最適化エンジン", "保有銘柄数"],
+        "内容": [now,
+                  f"¥{st.session_state.aum:,.0f}",
+                  st.session_state.benchmark,
+                  st.session_state.risk_mode,
+                  "Fixstars Amplify AE + IPOPT",
+                  f"{len(df)}銘柄"],
+    })
+    st.subheader("📄 レポート基本情報")
+    st.dataframe(hdr_df, use_container_width=True, hide_index=True)
+    st.divider()
+
+    # ── リスク・リターンサマリー ──────────────────────────────────────────────
+    st.subheader("📊 リスク・リターンサマリー")
+
+    # KPI メトリクス（st.metric でDOM安全）
+    m1, m2, m3, m4 = st.columns(4)
+    m1.metric("期待リターン（年率）",  f"{r['port_ret']*100:.2f}%")
+    m2.metric("ボラティリティ（年率）", f"{r['port_vol']*100:.2f}%")
+    m3.metric("シャープレシオ",        f"{r['port_sharpe']:.3f}")
+    m4.metric("ポートフォリオβ",      f"{r['port_beta']:.2f}")
+
+    m5, m6, m7, m8 = st.columns(4)
+    var_ok  = not r["var_breach"]
+    te_ok   = not r["te_breach"]
+    m5.metric("VaR 99%（1日）",
+              f"{r['port_var']*100:.2f}%",
+              delta=f"上限: {st.session_state.var_limit*100:.1f}%",
+              delta_color="normal" if var_ok else "inverse")
+    m6.metric("CVaR 99%（1日）", f"{r['port_cvar']*100:.2f}%")
+    m7.metric("TE（年率）",
+              f"{r['te']*100:.2f}%",
+              delta=f"上限: {st.session_state.te_limit*100:.1f}%",
+              delta_color="normal" if te_ok else "inverse")
+    m8.metric("HHI集中度", f"{r['port_hhi']:.4f}")
+
+    if not var_ok:
+        st.error("⚠️ VaR がマンデート上限を超過しています。")
+    if not te_ok:
+        st.error("⚠️ TE がマンデート上限を超過しています。")
+    if var_ok and te_ok:
+        st.success("✅ すべてのリスク指標がマンデート範囲内に収まっています。")
+
+    st.divider()
+
+    # ── RST 結果サマリー ──────────────────────────────────────────────────────
+    if st.session_state.rst_result is not None:
+        st.subheader("🔍 リバースストレステスト結果サマリー")
+        rst_rows = []
+        for name, res in st.session_state.rst_result["results"].items():
+            rst_rows.append({
+                "手法":              f"{res['icon']} {res['label']}",
+                "最悪損失（百万円）": int(res["pnl"]),
+                "計算時間（秒）":    round(res["time"], 3),
+                "シナリオ種別":     "⚠️ 想定外" if res.get("is_unexpected") else "✅ 想定内",
+                "主要シナリオ":     (res.get("top_scenarios") or [[("—", 0, {})]])[0][0]
+                                    if res.get("top_scenarios") else "—",
+            })
+        st.dataframe(
+            pd.DataFrame(rst_rows),
+            use_container_width=True,
+            hide_index=True,
+            column_config={
+                "最悪損失（百万円）": st.column_config.NumberColumn(format="%d"),
+                "計算時間（秒）":    st.column_config.NumberColumn(format="%.3f"),
+            },
+        )
+        # ── ヘッジ戦略サマリー ─────────────────────────────────────────────
+        st.subheader("🛡️ ヘッジ戦略推奨サマリー")
+        rst_results = st.session_state.rst_result["results"]
+        worst_key   = min(rst_results, key=lambda k: rst_results[k]["pnl"])
+        worst_res   = rst_results[worst_key]
+        top_sc      = worst_res.get("top_scenarios", [])
+
+        if top_sc:
+            primary_sc_name = top_sc[0][0]
+            primary_sc_info = top_sc[0][2]
+            hedge_dict      = primary_sc_info.get("hedge", {})
+
+            st.info(f"📌 主要シナリオ **「{primary_sc_name}」** に基づくヘッジ戦略")
+
+            if hedge_dict:
+                # st.dataframe で安全に描画（unsafe_allow_html 不使用）
+                hedge_rows = [{"優先度・カテゴリ": k, "推奨ヘッジ手段": v}
+                              for k, v in hedge_dict.items()]
+                st.dataframe(pd.DataFrame(hedge_rows), use_container_width=True, hide_index=True)
+            else:
+                st.write("このシナリオのヘッジ情報は現在準備中です。")
+
+            # 上位3シナリオのヘッジ比較
+            if len(top_sc) > 1:
+                st.write("**上位シナリオ別ヘッジ戦略比較**")
+                hedge_cmp_rows = []
+                for sc_name, sim, sc_info_i in top_sc[:3]:
+                    h = sc_info_i.get("hedge", {})
+                    p1 = list(h.values())[0] if h else "情報なし"
+                    hedge_cmp_rows.append({
+                        "シナリオ":   sc_name,
+                        "類似度":    f"{sim*100:.0f}%",
+                        "最優先ヘッジ": p1[:80] + "…" if len(p1) > 80 else p1,
+                    })
+                st.dataframe(pd.DataFrame(hedge_cmp_rows),
+                             use_container_width=True, hide_index=True)
+        st.divider()
+
+    # ── 推奨ポートフォリオ構成 ──────────────────────────────────────────────
+    st.subheader("📋 推奨ポートフォリオ構成")
+
+    display_cols = [c for c in ["コード","銘柄名","セクター","最適ウェイト（%）",
+                                 "投資金額（円）","推定口数","期待リターン（年率）",
+                                 "ボラティリティ（年率）","シャープレシオ","ベータ"]
+                    if c in df.columns]
+    st.dataframe(
+        df[display_cols].sort_values("最適ウェイト（%）", ascending=False),
+        use_container_width=True,
+        hide_index=True,
+        column_config={
+            "投資金額（円）":    st.column_config.NumberColumn(format="¥%d"),
+            "最適ウェイト（%）": st.column_config.NumberColumn(format="%.2f"),
+            "推定口数":         st.column_config.NumberColumn(format="%d"),
+        },
+    )
+    if "投資金額（円）" in df.columns:
+        total_inv = df["投資金額（円）"].sum()
+        st.write(f"**投資金額合計:** ¥{total_inv:,.0f}")
+
+    st.divider()
+
+    # ── セクター配分 ─────────────────────────────────────────────────────────
+    st.subheader("🏭 セクター配分")
+
+    col_sec, col_chart = st.columns([1, 1])
+    with col_sec:
+        sec_grp = df.groupby("セクター")["最適ウェイト（%）"].sum().reset_index()
+        sec_grp.columns = ["セクター", "ウェイト（%）"]
+        sec_grp = sec_grp.sort_values("ウェイト（%）", ascending=False)
+        st.dataframe(sec_grp, use_container_width=True, hide_index=True,
+                     column_config={
+                         "ウェイト（%）": st.column_config.NumberColumn(format="%.2f"),
+                     })
+    with col_chart:
+        import plotly.express as px
+        fig_pie = px.pie(
+            sec_grp, values="ウェイト（%）", names="セクター",
+            title="セクター配分", hole=0.35,
+        )
+        fig_pie.update_layout(margin=dict(t=40, b=10, l=10, r=10), height=300, paper_bgcolor="rgba(0,0,0,0)", font=dict(color="#ffffff"))
+        st.plotly_chart(fig_pie, use_container_width=True)
+
+    st.divider()
+
+    # ── 免責事項（st.caption でDOM安全） ─────────────────────────────────────
+    st.caption("📌 免責事項：本レポートは量子アニーリング（Fixstars Amplify AE）および"
+               "非線形最適化（IPOPT）に基づく意思決定支援情報であり、投資勧誘ではありません。"
+               "最終的な投資判断は運用担当者の責任において行ってください。")
+    st.caption("© TESTROGY Inc. — 量子アニーリング × 金融リスク管理ソリューション")
