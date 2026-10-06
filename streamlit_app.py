@@ -1990,54 +1990,81 @@ def is_conventional_scenario(levels_idx):
     return len(set(nonzero)) == 1 or len(nonzero) <= 2
 
 # ── 古典ソルバー ─────────────────────────────────────────────────────────────
-def rst_greedy(w, df_sel, aum, n_iter=20):
-    """座標降下法：1ファクターずつ最悪水準に設定"""
+def _time_up(t0, time_limit_sec):
+    """経過時間が上限に達したか（time_limit_sec=None/0 は無制限）"""
+    return bool(time_limit_sec) and (time.perf_counter() - t0) >= time_limit_sec
+
+def rst_greedy(w, df_sel, aum, n_iter=20, time_limit_sec=None):
+    """座標降下法：1ファクターずつ最悪水準に設定（時間上限で打ち切り）
+    戻り値: best_idx, pnl, elapsed, n_eval, timed_out"""
     best_idx = np.array([3]*N_RST_FACTORS, dtype=int)  # 初期: ゼロ水準
     t0 = time.perf_counter()
+    n_eval, timed_out = 0, False
     for _ in range(n_iter):
         improved = False
         for j in range(N_RST_FACTORS):
+            if _time_up(t0, time_limit_sec):
+                timed_out = True
+                break
             best_l, best_pnl = best_idx[j], 1e18
             for l in range(N_RST_LEVELS):
                 tmp = best_idx.copy(); tmp[j] = l
                 pnl, _ = calc_rst_pnl(tmp, w, df_sel, aum)
+                n_eval += 1
                 if pnl < best_pnl:
                     best_pnl, best_l = pnl, l
             if best_l != best_idx[j]:
                 best_idx[j] = best_l; improved = True
-        if not improved:
+        if timed_out or not improved:
             break
     elapsed = time.perf_counter() - t0
-    pnl, pnl_by_fac = calc_rst_pnl(best_idx, w, df_sel, aum)
-    return best_idx, pnl, elapsed
+    pnl, _ = calc_rst_pnl(best_idx, w, df_sel, aum)
+    return best_idx, pnl, elapsed, n_eval, timed_out
 
-def rst_random(w, df_sel, aum, n_iter=1000, seed=42):
+def rst_random(w, df_sel, aum, n_iter=1000, seed=42, time_limit_sec=None):
+    """ランダム探索（反復上限 or 時間上限の早い方で停止）
+    戻り値: best_idx, best_pnl, elapsed, history, n_eval, timed_out"""
     rng = np.random.default_rng(seed)
+    t0 = time.perf_counter()
     best_idx = rng.integers(0, N_RST_LEVELS, N_RST_FACTORS)
     best_pnl, _ = calc_rst_pnl(best_idx, w, df_sel, aum)
     history = [best_pnl]
-    t0 = time.perf_counter()
+    n_eval, timed_out = 1, False
     for _ in range(n_iter):
+        if _time_up(t0, time_limit_sec):
+            timed_out = True
+            break
         idx = rng.integers(0, N_RST_LEVELS, N_RST_FACTORS)
         pnl, _ = calc_rst_pnl(idx, w, df_sel, aum)
+        n_eval += 1
         if pnl < best_pnl:
             best_pnl, best_idx = pnl, idx.copy()
         history.append(best_pnl)
-    return best_idx, best_pnl, time.perf_counter() - t0, history
+    return best_idx, best_pnl, time.perf_counter() - t0, history, n_eval, timed_out
 
-def rst_sa(w, df_sel, aum, T_init=500.0, T_min=0.5, alpha=0.99, seed=0):
+def rst_sa(w, df_sel, aum, T_init=500.0, T_min=0.5, alpha=0.99, seed=0,
+           time_limit_sec=None, init_ratio=0.3):
+    """模擬焼きなまし法（初期解の貪欲法を含めて時間上限内に収める）
+    init_ratio: 時間上限のうち初期解（貪欲法）に割り当てる割合
+    戻り値: best_idx, best_pnl, elapsed, history, n_eval, timed_out"""
     rng = np.random.default_rng(seed)
-    cur_idx, _, _ = rst_greedy(w, df_sel, aum)
+    t0 = time.perf_counter()
+    init_limit = time_limit_sec * init_ratio if time_limit_sec else None
+    cur_idx, _, _, n_eval, timed_out = rst_greedy(w, df_sel, aum, time_limit_sec=init_limit)
     cur_pnl, _ = calc_rst_pnl(cur_idx, w, df_sel, aum)
     best_idx, best_pnl = cur_idx.copy(), cur_pnl
     T = T_init; history = []; cnt = 0
-    t0 = time.perf_counter()
+    timed_out = False
     while T > T_min:
         for _ in range(15):
+            if _time_up(t0, time_limit_sec):
+                timed_out = True
+                break
             new_idx = cur_idx.copy()
             j = rng.integers(0, N_RST_FACTORS)
             new_idx[j] = rng.integers(0, N_RST_LEVELS)
             new_pnl, _ = calc_rst_pnl(new_idx, w, df_sel, aum)
+            n_eval += 1
             delta = new_pnl - cur_pnl
             if delta < 0 or rng.random() < math.exp(-abs(delta)/(T+0.1)):
                 cur_idx, cur_pnl = new_idx, new_pnl
@@ -2045,8 +2072,10 @@ def rst_sa(w, df_sel, aum, T_init=500.0, T_min=0.5, alpha=0.99, seed=0):
                     best_pnl, best_idx = cur_pnl, cur_idx.copy()
             cnt += 1
         history.append((cnt, best_pnl))
+        if timed_out:
+            break
         T *= alpha
-    return best_idx, best_pnl, time.perf_counter() - t0, history
+    return best_idx, best_pnl, time.perf_counter() - t0, history, n_eval, timed_out
 
 # ══════════════════════════════════════════════════════════════════════════════
 # セッション状態
@@ -3035,6 +3064,11 @@ elif page == "🔍 リバースストレステスト":
     with c3:
         run_qa = st.checkbox("量子AE（要Amplifyトークン）",
                               value=bool(st.session_state.amplify_token))
+        solver_timeout_sec = st.number_input(
+            "ソルバー実行時間上限（秒／手法ごと）", min_value=1, max_value=600,
+            value=30, step=5,
+            help="各ソルバー（ランダム・貪欲法・SA・量子AE）の実行時間上限。"
+                 "上限に達した時点の最良解を結果として採用します。")
 
     run_rst = st.button("🚀 RST実行（全手法）", type="primary", use_container_width=True)
 
@@ -3046,9 +3080,11 @@ elif page == "🔍 リバースストレステスト":
         if run_classical:
             status.info("🎲 ランダム探索実行中...")
             prog.progress(5)
-            rs_idx, rs_pnl, rs_t, rs_hist = rst_random(w, df, aum, n_iter=n_sa_iter)
+            rs_idx, rs_pnl, rs_t, rs_hist, rs_eval, rs_to = rst_random(
+                w, df, aum, n_iter=n_sa_iter, time_limit_sec=solver_timeout_sec)
             rst_results["ランダム探索"] = {
                 "idx": rs_idx, "pnl": rs_pnl, "time": rs_t, "history": rs_hist,
+                "n_eval": rs_eval, "timed_out": rs_to,
                 "label": "ランダム探索", "color": "#ffffff", "icon": "🎲",
             }
             prog.progress(20)
@@ -3057,9 +3093,11 @@ elif page == "🔍 リバースストレステスト":
         if run_classical:
             status.info("📋 貪欲法（座標降下）実行中...")
             prog.progress(25)
-            g_idx, g_pnl, g_t = rst_greedy(w, df, aum)
+            g_idx, g_pnl, g_t, g_eval, g_to = rst_greedy(
+                w, df, aum, time_limit_sec=solver_timeout_sec)
             rst_results["貪欲法"] = {
                 "idx": g_idx, "pnl": g_pnl, "time": g_t, "history": None,
+                "n_eval": g_eval, "timed_out": g_to,
                 "label": "貪欲法（座標降下）", "color": "#22c55e", "icon": "📋",
             }
             prog.progress(40)
@@ -3068,9 +3106,11 @@ elif page == "🔍 リバースストレステスト":
         if run_classical:
             status.info("🌡️ 模擬焼きなまし法実行中...")
             prog.progress(45)
-            sa_idx, sa_pnl, sa_t, sa_hist = rst_sa(w, df, aum)
+            sa_idx, sa_pnl, sa_t, sa_hist, sa_eval, sa_to = rst_sa(
+                w, df, aum, time_limit_sec=solver_timeout_sec)
             rst_results["模擬焼きなまし法"] = {
                 "idx": sa_idx, "pnl": sa_pnl, "time": sa_t, "history": sa_hist,
+                "n_eval": sa_eval, "timed_out": sa_to,
                 "label": "模擬焼きなまし法 (SA)", "color": "#f97316", "icon": "🌡️",
             }
             prog.progress(65)
@@ -3103,7 +3143,7 @@ elif page == "🔍 リバースストレステスト":
 
                 client = FixstarsClient()
                 client.token = st.session_state.amplify_token
-                client.parameters.timeout = timedelta(seconds=5.0)
+                client.parameters.timeout = timedelta(seconds=float(solver_timeout_sec))
                 t0_qa = time.perf_counter()
                 result_qa = solve(Model(H), client)
                 qa_t = time.perf_counter() - t0_qa
@@ -3118,6 +3158,7 @@ elif page == "🔍 リバースストレステスト":
                 qa_pnl, _ = calc_rst_pnl(qa_idx, w, df, aum)
                 rst_results["量子アニーリング"] = {
                     "idx": qa_idx, "pnl": qa_pnl, "time": qa_t, "history": None,
+                    "n_eval": None, "timed_out": None,
                     "label": "量子AE (Amplify)", "color": "#7c3aed", "icon": "⚛️",
                 }
             except Exception as e:
@@ -3190,6 +3231,9 @@ elif page == "🔍 リバースストレステスト":
             "手法":          f"{res['icon']} {res['label']}",
             "最悪損失（百万円）": int(res["pnl"]),
             "計算時間（秒）": round(res["time"], 3),
+            "評価回数":      res.get("n_eval") if res.get("n_eval") is not None else "—",
+            "停止理由":      ("⏱️ 時間上限" if res.get("timed_out")
+                              else "—" if res.get("timed_out") is None else "✅ 収束/反復完了"),
             "主要シナリオ":  sc_name,
             "シナリオ種別":  "⚠️ 想定外" if res.get("is_unexpected") else "✅ 想定内",
         })
