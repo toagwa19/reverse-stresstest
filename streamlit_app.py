@@ -1485,19 +1485,20 @@ def hhi(w):
 # ══════════════════════════════════════════════════════════════════════════════
 # RST計算エンジン
 # ══════════════════════════════════════════════════════════════════════════════
-def calc_rst_pnl(levels_idx, w, df_sel, aum):
-    """
-    108ファクターに対するポートフォリオPnL（百万円）
-    カテゴリ別にデルタ/ガンマ/ベガ/クロスΓを計算。
-    PnL ≈ Σ(Δ寄与) + Σ(Γ寄与) + Σ(クロスΓ寄与)
-    """
-    n = len(df_sel)
-    # moves[j] = j番目ファクターの変化量（実数）
-    moves = np.array([RST_FACTORS[j]["levels"][int(levels_idx[j])]
-                      for j in range(N_RST_FACTORS)], dtype=float)
-    cats  = [RST_FACTORS[j]["category"] for j in range(N_RST_FACTORS)]
-    names = [RST_FACTORS[j]["name"]     for j in range(N_RST_FACTORS)]
+# ── RST PnL 計算（高速版） ──────────────────────────────────────────────────
+# ポートフォリオ感応度は (w, df_sel) が同じ限り不変なので1回だけ計算し、
+# 「ファクター j を水準 l にしたときのPnL」を事前にテーブル化する。
+# 他ファクターに依存する項（株式Γ・クロスΓ）は TOPIX/USDJPY/10Y の水準組合せ
+# (7×7×7=343通り) ごとにテーブルを持つため、計算結果は従来版と完全に一致する。
+_M_TOPIX  = _fi("TOPIX変化率")
+_M_USDJPY = _fi("USD/JPY変化率")
+_M_10Y    = _fi("10Y JGB金利変化")
+_LEVELS_ARR = np.array([f["levels"] for f in RST_FACTORS], dtype=float)  # (F, L)
 
+def _rst_context(w, df_sel, aum):
+    """ポートフォリオ加重感応度（シナリオに依存しない部分）"""
+    w = np.asarray(w, dtype=float)
+    n = len(df_sel)
     # ── ポートフォリオ加重平均感応度 ────────────────────────────────────────
     def wsum(col, default=0.0):
         if col in df_sel.columns:
@@ -1525,8 +1526,9 @@ def calc_rst_pnl(levels_idx, w, df_sel, aum):
     avg_vol   = float(np.dot(w, df_sel["ボラティリティ（年率）"].fillna(0.2).values))
 
     # セクター別ウェイト
+    _secs = df_sel["セクター"].values
     def sec_w(sec_list):
-        return sum(w[i] for i in range(n) if df_sel.iloc[i]["セクター"] in sec_list)
+        return float(np.sum(w[np.isin(_secs, sec_list)]))
 
     w_fin  = sec_w(["金融"])
     w_re   = sec_w(["不動産"])
@@ -1534,424 +1536,345 @@ def calc_rst_pnl(levels_idx, w, df_sel, aum):
     w_con  = sec_w(["消費財"])
     w_it   = sec_w(["情報技術"])
 
-    # TOPIX・10Y 変化量を先取り（クロスΓで使う）
-    m_topix  = moves[_fi("TOPIX変化率")]         if _fi("TOPIX変化率")>=0 else 0.0
-    m_usdjpy = moves[_fi("USD/JPY変化率")]        if _fi("USD/JPY変化率")>=0 else 0.0
-    m_10y    = moves[_fi("10Y JGB金利変化")]      if _fi("10Y JGB金利変化")>=0 else 0.0
+    c = dict(aum=aum,
+             style_bias=wsum("ガンマ係数", 0.01) * 5)
+    for k in ['topix_s', 'nk225_s', 'small_s', 'sp500_s', 'gamma_s', 'vix_s', 'iv_s', 'fx_usd_s', 'fx_eur_s', 'rate2y_s', 'rate10y_s', 'yc_s', 'cg_fxeq_s', 'cg_eqr_s', 'credit_s', 'hy_s', 'oil_s', 'gold_s', 'avg_vol', 'w_fin', 'w_re', 'w_ene', 'w_con', 'w_it']:
+        c[k] = locals()[k]
+    return c
 
-    pnl_total = 0.0
-    pnl_by_factor = []
+def _factor_pnl(nm, cat, mv, m_topix, m_usdjpy, m_10y, c):
+    """1ファクター分のPnL（百万円）。ロジックは従来の calc_rst_pnl と同一"""
+    aum = c["aum"]
+    topix_s = c["topix_s"]
+    nk225_s = c["nk225_s"]
+    small_s = c["small_s"]
+    sp500_s = c["sp500_s"]
+    gamma_s = c["gamma_s"]
+    vix_s = c["vix_s"]
+    iv_s = c["iv_s"]
+    fx_usd_s = c["fx_usd_s"]
+    fx_eur_s = c["fx_eur_s"]
+    rate2y_s = c["rate2y_s"]
+    rate10y_s = c["rate10y_s"]
+    yc_s = c["yc_s"]
+    cg_fxeq_s = c["cg_fxeq_s"]
+    cg_eqr_s = c["cg_eqr_s"]
+    credit_s = c["credit_s"]
+    hy_s = c["hy_s"]
+    oil_s = c["oil_s"]
+    gold_s = c["gold_s"]
+    avg_vol = c["avg_vol"]
+    w_fin = c["w_fin"]
+    w_re = c["w_re"]
+    w_ene = c["w_ene"]
+    w_con = c["w_con"]
+    w_it = c["w_it"]
+    pnl_j = 0.0
 
-    for j in range(N_RST_FACTORS):
-        mv   = moves[j]
-        cat  = cats[j]
-        nm   = names[j]
-        pnl_j = 0.0
+    # ── A. 株式系 ─────────────────────────────────────────────────────
+    if cat == "株式Δ":
+        if "TOPIX" in nm and "小型" not in nm and "急落" not in nm:
+            pnl_j = topix_s * (mv/100) * aum / 1e6
+        elif "日経225" in nm:
+            pnl_j = nk225_s * (mv/100) * aum / 1e6
+        elif "小型" in nm:
+            pnl_j = small_s * (mv/100) * aum / 1e6
+        elif "S&P500" in nm:
+            pnl_j = sp500_s * (mv/100) * aum / 1e6
+        elif "MSCI" in nm or "STOXX" in nm or "CSI" in nm:
+            pnl_j = sp500_s * 0.7 * (mv/100) * aum / 1e6
+        else:
+            pnl_j = topix_s * 0.5 * (mv/100) * aum / 1e6
 
-        # ── A. 株式系 ─────────────────────────────────────────────────────
-        if cat == "株式Δ":
-            if "TOPIX" in nm and "小型" not in nm and "急落" not in nm:
-                pnl_j = topix_s * (mv/100) * aum / 1e6
-            elif "日経225" in nm:
-                pnl_j = nk225_s * (mv/100) * aum / 1e6
-            elif "小型" in nm:
-                pnl_j = small_s * (mv/100) * aum / 1e6
-            elif "S&P500" in nm:
-                pnl_j = sp500_s * (mv/100) * aum / 1e6
-            elif "MSCI" in nm or "STOXX" in nm or "CSI" in nm:
-                pnl_j = sp500_s * 0.7 * (mv/100) * aum / 1e6
-            else:
-                pnl_j = topix_s * 0.5 * (mv/100) * aum / 1e6
+    elif cat == "株式Γ":
+        # Γ項: ½ γ (ΔTOPIX)² × 非線形係数
+        pnl_j = -0.5 * abs(gamma_s) * (m_topix/100)**2 * aum / 1e6 * abs(mv)
 
-        elif cat == "株式Γ":
-            # Γ項: ½ γ (ΔTOPIX)² × 非線形係数
-            pnl_j = -0.5 * abs(gamma_s) * (m_topix/100)**2 * aum / 1e6 * abs(mv)
+    elif cat == "スタイル":
+        # スタイルファクター：ポートフォリオのスタイルバイアス（簡易）
+        style_bias = c["style_bias"]  # 代理変数
+        pnl_j = style_bias * (mv/100) * aum * 0.3 / 1e6
 
-        elif cat == "スタイル":
-            # スタイルファクター：ポートフォリオのスタイルバイアス（簡易）
-            style_bias = wsum("ガンマ係数", 0.01) * 5  # 代理変数
-            pnl_j = style_bias * (mv/100) * aum * 0.3 / 1e6
+    elif cat == "セクターΔ":
+        if "情報技術" in nm:
+            pnl_j = w_it * (mv/100) * aum / 1e6
+        elif "金融" in nm:
+            pnl_j = w_fin * (mv/100) * aum / 1e6
+        elif "不動産" in nm:
+            pnl_j = w_re * (mv/100) * aum / 1e6
+        elif "エネルギー" in nm:
+            pnl_j = w_ene * (mv/100) * aum / 1e6
+        else:
+            pnl_j = (mv/100) * aum * 0.05 / 1e6
 
-        elif cat == "セクターΔ":
-            if "情報技術" in nm:
-                pnl_j = w_it * (mv/100) * aum / 1e6
-            elif "金融" in nm:
-                pnl_j = w_fin * (mv/100) * aum / 1e6
-            elif "不動産" in nm:
-                pnl_j = w_re * (mv/100) * aum / 1e6
-            elif "エネルギー" in nm:
-                pnl_j = w_ene * (mv/100) * aum / 1e6
-            else:
-                pnl_j = (mv/100) * aum * 0.05 / 1e6
+    # ── B. ボラティリティ系（SABR含む）──────────────────────────────────
+    elif cat == "VIX系":
+        if "VVIX" in nm:
+            pnl_j = -abs(vix_s) * (mv/100) * aum * 0.15 / 1e6
+        elif "期間構造" in nm:
+            # VIX期間構造逆転はショートガンマ戦略にとってリスク
+            pnl_j = -abs(vix_s) * (mv/100) * aum * 0.10 / 1e6
+        else:
+            pnl_j = vix_s * (mv/100) * aum * 0.3 / 1e6 \
+                    - avg_vol * (mv/100) * aum * 0.2 / 1e6
 
-        # ── B. ボラティリティ系（SABR含む）──────────────────────────────────
-        elif cat == "VIX系":
-            if "VVIX" in nm:
-                pnl_j = -abs(vix_s) * (mv/100) * aum * 0.15 / 1e6
-            elif "期間構造" in nm:
-                # VIX期間構造逆転はショートガンマ戦略にとってリスク
-                pnl_j = -abs(vix_s) * (mv/100) * aum * 0.10 / 1e6
-            else:
-                pnl_j = vix_s * (mv/100) * aum * 0.3 / 1e6 \
-                        - avg_vol * (mv/100) * aum * 0.2 / 1e6
+    elif cat == "VolSurf":
+        pnl_j = iv_s * (mv/100) * aum * 0.25 / 1e6
 
-        elif cat == "VolSurf":
-            pnl_j = iv_s * (mv/100) * aum * 0.25 / 1e6
-
-        elif cat == "SABR":
-            # SABR α: ボラ水準上昇 → ショートベガに損失
-            # SABR ρ: ρ低下（負値増大）→ 左歪みが強まる → Put側損失
-            # SABR ν: ν上昇 → ガンマコスト増大 → 損失
-            if "α" in nm:
-                pnl_j = iv_s * (mv/100) * aum * 0.30 / 1e6
-            elif "ρ" in nm:
-                pnl_j = -abs(gamma_s) * (mv/100) * aum * 0.20 / 1e6
-            elif "ν" in nm:
-                pnl_j = -abs(gamma_s) * (mv/100) * aum * 0.25 / 1e6
-            elif "β" in nm:
-                pnl_j = iv_s * 0.5 * (mv/100) * aum * 0.10 / 1e6
-            else:
-                pnl_j = 0.0
-
-        elif cat == "VolSkew":
-            # ボラスキュー変化: Put側スキュー拡大 → プット保護コスト増
-            if "Put" in nm:
-                pnl_j = -abs(iv_s) * (mv/100) * aum * 0.20 / 1e6
-            elif "Call" in nm:
-                pnl_j = abs(iv_s) * (mv/100) * aum * 0.10 / 1e6
-            elif "カートシス" in nm:
-                pnl_j = -abs(gamma_s) * (mv/100) * aum * 0.15 / 1e6
-            else:
-                pnl_j = iv_s * (mv/100) * aum * 0.10 / 1e6
-
-        # ── C. FX系（Vanna-Volga含む）───────────────────────────────────────
-        elif cat == "FXΔ":
-            if "USD/JPY" in nm:
-                pnl_j = fx_usd_s * (mv/100) * aum / 1e6
-            elif "EUR/JPY" in nm or "EUR" in nm:
-                pnl_j = fx_eur_s * (mv/100) * aum / 1e6
-            elif "GBP" in nm:
-                pnl_j = fx_eur_s * 0.8 * (mv/100) * aum / 1e6
-            elif "AUD" in nm:
-                pnl_j = (oil_s * 0.3 + fx_usd_s * 0.4) * (mv/100) * aum / 1e6
-            elif "CNH" in nm or "新興国" in nm:
-                pnl_j = fx_usd_s * 0.3 * (mv/100) * aum / 1e6
-            else:
-                pnl_j = fx_usd_s * 0.5 * (mv/100) * aum / 1e6
-
-        elif cat == "FX VolSurf":
-            pnl_j = abs(iv_s) * (mv/100) * aum * 0.15 / 1e6
-
-        elif cat == "VannaVolga":
-            # VV: PnL ≈ x₁·Vanna·RR + x₂·Volga·BF
-            # RR（リスクリバーサル）が拡大 → 外国人の円プット需要増 → コスト増
-            # BF（バタフライ）が拡大 → 両テールのIV上昇 → ヘッジコスト増
-            if "RR" in nm:
-                # RR拡大 = 円安リスクプレミアム上昇 → 外貨資産保有者は円コストが増
-                pnl_j = -abs(fx_usd_s) * abs(cg_fxeq_s) * (mv/100) * aum * 0.15 / 1e6
-            elif "BF" in nm:
-                # BF拡大 = テールリスクプレミアム上昇
-                pnl_j = -abs(gamma_s) * (mv/100) * aum * 0.10 / 1e6
-            elif "Vanna" in nm:
-                # Vanna = ∂²V/∂S∂σ : FX移動とIV変化の交差感応度
-                pnl_j = -abs(fx_usd_s) * abs(iv_s) * (mv/100) * aum * 0.20 / 1e6
-            elif "Volga" in nm:
-                # Volga = ∂²V/∂σ² : IVに対する凸性
-                pnl_j = -abs(gamma_s) * (mv/100) * aum * 0.18 / 1e6
-            else:
-                pnl_j = 0.0
-
-        elif cat == "FX相関":
-            # FX通貨ペア間の相関変化: 分散効果に影響
-            pnl_j = -abs(fx_usd_s) * (mv/100) * aum * 0.10 / 1e6
-
-        # ── D. 金利・期間構造 ─────────────────────────────────────────────────
-        elif cat == "金利期間構造":
-            # テナー別感応度（10Yを基準に逓減）
-            tenor_weights = {
-                "1M": 0.05, "3M": 0.1, "6M": 0.2, "1Y": 0.4,
-                "2Y": 0.6,  "5Y": 0.8, "10Y": 1.0, "20Y": 1.3, "30Y": 1.5,
-            }
-            tw = 1.0
-            for t, w_t in tenor_weights.items():
-                if t + " " in nm or nm.endswith(t):
-                    tw = w_t; break
-            pnl_j = rate10y_s * tw * (mv/100) * aum / 1e6
-
-        elif cat == "カーブ形状":
-            pnl_j = yc_s * (mv/100) * aum / 1e6
-
-        elif cat == "金利ボラ":
-            # スワップションIV上昇: 金利ヘッジコスト増
-            pnl_j = -abs(rate10y_s) * (mv/100) * aum * 0.15 / 1e6
-
-        elif cat == "金利スプレッド":
-            if "日米金利差" in nm:
-                pnl_j = (fx_usd_s + rate10y_s * 0.5) * (mv/100) * aum * 0.3 / 1e6
-            elif "実質金利" in nm:
-                pnl_j = rate10y_s * (mv/100) * aum * 0.8 / 1e6
-            elif "TONAR" in nm:
-                pnl_j = -(w_fin * 0.3 + abs(credit_s) * 0.2) * (mv/100) * aum / 1e6
-            else:
-                pnl_j = rate10y_s * 0.5 * (mv/100) * aum / 1e6
-
-        # ── E. クレジット系 ───────────────────────────────────────────────────
-        elif cat == "クレジット":
-            if "金融" in nm:
-                pnl_j = -w_fin * (mv/100) * aum * 0.8 / 1e6 \
-                        + credit_s * (mv/100) * aum * 0.3 / 1e6
-            elif "不動産" in nm:
-                pnl_j = -w_re * (mv/100) * aum * 0.7 / 1e6
-            elif "HY" in nm or "ハイイールド" in nm:
-                pnl_j = hy_s * (mv/100) * aum * 0.5 / 1e6
-            elif "デフォルト相関" in nm:
-                # 相関上昇 → CDO/CLOトランシェが非線形に損失
-                pnl_j = -abs(credit_s) * (mv/100) * aum * 0.30 / 1e6
-            elif "リカバリー" in nm:
-                pnl_j = abs(credit_s) * (mv/100) * aum * 0.15 / 1e6
-            elif "フォーリングエンジェル" in nm or "BBB" in nm:
-                pnl_j = -(abs(credit_s) + abs(hy_s)) * (mv/100) * aum * 0.25 / 1e6
-            elif "シニア-サブ" in nm:
-                pnl_j = -(w_fin + w_re) * (mv/100) * aum * 0.4 / 1e6
-            else:
-                pnl_j = credit_s * (mv/100) * aum * 0.4 / 1e6
-
-        # ── F. コモディティ系 ─────────────────────────────────────────────────
-        elif cat == "エネルギー":
-            if "期間構造" in nm:
-                pnl_j = oil_s * (mv/100) * aum * 0.2 / 1e6
-            else:
-                pnl_j = (w_ene * 0.6 - w_con * 0.3) * (mv/100) * aum / 1e6 \
-                        + oil_s * (mv/100) * aum * 0.3 / 1e6
-
-        elif cat == "貴金属":
-            if "金" in nm:
-                pnl_j = gold_s * (mv/100) * aum / 1e6
-            else:
-                pnl_j = gold_s * 0.7 * (mv/100) * aum / 1e6
-
-        elif cat == "産業金属":
-            # 銅・鉄鉱石 ↑ → 製造業コスト ↑ → 消費財・資本財に逆風
-            pnl_j = -w_con * 0.3 * (mv/100) * aum / 1e6 \
-                    + oil_s * 0.3 * (mv/100) * aum / 1e6
-
-        elif cat == "農産物":
-            pnl_j = -w_con * 0.2 * (mv/100) * aum / 1e6
-
-        elif cat == "コモボラ":
-            if "OVX" in nm:
-                pnl_j = -oil_s * (mv/100) * aum * 0.2 / 1e6
-            else:
-                pnl_j = -abs(oil_s) * (mv/100) * aum * 0.1 / 1e6
-
-        # ── G. 流動性・マクロ系 ─────────────────────────────────────────────
-        elif cat == "流動性":
-            # Amihud流動性指数悪化 → スリッページ拡大 → 実損失増加
-            pnl_j = -topix_s * abs(mv/100) * aum * 0.25 / 1e6
-
-        elif cat == "マクロ":
-            if "GDP" in nm:
-                pnl_j = topix_s * (mv/100) * aum * 0.5 / 1e6
-            elif "CPI" in nm:
-                pnl_j = -(w_con + abs(rate10y_s * 0.3)) * (mv/100) * aum / 1e6
-            elif "PMI" in nm:
-                pnl_j = topix_s * 0.4 * (mv/100) * aum / 1e6
-            else:
-                pnl_j = 0.0
-
-        elif cat == "センチ":
-            if "Put/Call" in nm:
-                # P/C比上昇 → 市場が弱気 → 株安
-                pnl_j = -topix_s * abs(mv/100) * aum * 0.2 / 1e6
-            elif "システミック" in nm:
-                pnl_j = -(topix_s + abs(credit_s)) * (mv/100) * aum * 0.3 / 1e6
-
-        # ── クロスガンマ項（非線形交叉） ────────────────────────────────────
-        elif cat == "クロスΓ":
-            if "FX" in nm and "株" in nm:
-                pnl_j = cg_fxeq_s * (m_topix/100) * (m_usdjpy/100) * aum / 1e6 * abs(mv)
-            elif "株" in nm and "金利" in nm:
-                pnl_j = -cg_eqr_s * abs(m_topix/100) * abs(m_10y/100) * aum / 1e6 * abs(mv)
-            elif "流動性" in nm and "株" in nm:
-                pnl_j = -topix_s * abs(gamma_s) * (mv/100) * aum * 0.3 / 1e6
-            elif "原油" in nm and "FX" in nm:
-                pnl_j = -(oil_s * fx_usd_s) * (mv/100) * aum * 0.2 / 1e6
-            elif "クレジット" in nm:
-                pnl_j = -abs(credit_s) * abs(m_topix/100) * aum * 0.15 / 1e6 * abs(mv)
-            else:
-                pnl_j = -abs(gamma_s) * (mv/100) * aum * 0.1 / 1e6
-
-        pnl_total += pnl_j
-        pnl_by_factor.append({
-            "ファクター": nm, "変化量": mv,
-            "単位":       RST_FACTORS[j]["unit"],
-            "カテゴリ":   cat,
-            "グループ":   RST_FACTORS[j].get("group", "?"),
-            "PnL（百万円）": pnl_j,
-        })
-
-    return pnl_total, pnl_by_factor
-    pnl_total = 0.0
-    pnl_by_factor = []
-
-    # ── セクターファクター感応度マトリクス ────────────────────────────────
-    sector_topix_mult = {
-        "情報技術": 1.3, "金融": 0.9, "ヘルスケア": 0.7, "消費財": 0.8, "資本財": 1.1,
-        "エネルギー": 0.6, "素材": 1.0, "通信": 0.6, "公益事業": 0.5, "不動産": 1.2,
-    }
-    sector_fx_mult = {
-        "情報技術": 0.4, "金融": -0.1, "ヘルスケア": 0.2, "消費財": -0.2, "資本財": 0.5,
-        "エネルギー": 0.1, "素材": 0.3, "通信": -0.1, "公益事業": -0.2, "不動産": -0.3,
-    }
-    sector_rate_mult = {
-        "情報技術": -0.4, "金融": 0.5, "ヘルスケア": -0.1, "消費財": -0.1, "資本財": -0.2,
-        "エネルギー": 0.0, "素材": -0.1, "通信": -0.2, "公益事業": -0.5, "不動産": -0.6,
-    }
-    sector_hy_mult = {
-        "情報技術": -0.2, "金融": -0.6, "ヘルスケア": -0.1, "消費財": -0.2, "資本財": -0.3,
-        "エネルギー": -0.4, "素材": -0.2, "通信": -0.3, "公益事業": -0.4, "不動産": -0.7,
-    }
-
-    # 各ファクターの変化量（実数）を先に取り出す
-    moves = [RST_FACTORS[j]["levels"][int(levels_idx[j])] for j in range(N_RST_FACTORS)]
-    factor_names = [RST_FACTORS[j]["name"] for j in range(N_RST_FACTORS)]
-
-    # ── ファクター別PnL計算 ────────────────────────────────────────────────
-    for j, fac in enumerate(RST_FACTORS):
-        move = moves[j]
-        name = fac["name"]
-        cat  = fac.get("category", "")
-
-        if name == "TOPIX変化率":
-            sens = sum(
-                w[i] * df_sel.iloc[i]["TOPIX感応度"] *
-                sector_topix_mult.get(df_sel.iloc[i]["セクター"], 1.0)
-                for i in range(len(df_sel)))
-            pnl_j = sens * (move / 100) * aum / 1e6
-
-        elif name == "日経225変化率":
-            sens = sum(
-                w[i] * df_sel.iloc[i].get("日経225感応度", df_sel.iloc[i]["TOPIX感応度"] * 1.05) *
-                sector_topix_mult.get(df_sel.iloc[i]["セクター"], 1.0)
-                for i in range(len(df_sel)))
-            pnl_j = sens * (move / 100) * aum / 1e6
-
-        elif name == "TOPIX小型株変化率":
-            # 小型株ウェイトは時価総額の小さい銘柄ほど感応度高い
-            sens = sum(
-                w[i] * df_sel.iloc[i].get("小型株感応度", 1.2) *
-                sector_topix_mult.get(df_sel.iloc[i]["セクター"], 1.0) * 0.8
-                for i in range(len(df_sel)))
-            pnl_j = sens * (move / 100) * aum / 1e6
-
-        elif name == "米国株(S&P500)連動変化率":
-            sens = sum(
-                w[i] * df_sel.iloc[i].get("S&P500感応度", 0.5)
-                for i in range(len(df_sel)))
-            pnl_j = sens * (move / 100) * aum / 1e6
-
-        elif name == "TOPIX急落加速【ガンマ】":
-            # ガンマ項：PnL ≈ ½ × Σᵢ wᵢ×γᵢ × (TOPIX変化)²
-            topix_move = moves[factor_names.index("TOPIX変化率")]
-            gamma_sens = sum(w[i] * df_sel.iloc[i].get("ガンマ係数", 0.02)
-                             for i in range(len(df_sel)))
-            pnl_j = -0.5 * gamma_sens * (topix_move / 100)**2 * aum / 1e6 * abs(move)
-
-        elif name == "VIX変化":
-            avg_vol = df_sel["ボラティリティ（年率）"].values @ w
-            vix_sens_port = sum(w[i] * abs(df_sel.iloc[i].get("VIX感応度", -0.1))
-                                for i in range(len(df_sel)))
-            pnl_j = -vix_sens_port * (move / 100) * aum * 0.3 / 1e6 - avg_vol * (move/100)*aum*0.2/1e6
-
-        elif name == "日本株IV変化【ベガ】":
-            iv_sens_port = sum(w[i] * abs(df_sel.iloc[i].get("日本株IV感応度", -0.15))
-                               for i in range(len(df_sel)))
-            pnl_j = -iv_sens_port * (move / 100) * aum * 0.25 / 1e6
-
-        elif name == "USD/JPY変化率":
-            sens = sum(
-                w[i] * df_sel.iloc[i].get("FX感応度(USD)", df_sel.iloc[i]["FX感応度"]) *
-                sector_fx_mult.get(df_sel.iloc[i]["セクター"], 0.0)
-                for i in range(len(df_sel)))
-            pnl_j = sens * (move / 100) * aum / 1e6
-
-        elif name == "EUR/JPY変化率":
-            sens = sum(
-                w[i] * df_sel.iloc[i].get("FX感応度(EUR)", df_sel.iloc[i]["FX感応度"] * 0.6) *
-                sector_fx_mult.get(df_sel.iloc[i]["セクター"], 0.0)
-                for i in range(len(df_sel)))
-            pnl_j = sens * (move / 100) * aum / 1e6
-
-        elif name == "USD/JPY×株式クロスΓ":
-            # クロスガンマ項: PnL ≈ Σᵢ wᵢ×Γ_FX_EQ × Δ_TOPIX × Δ_USDJPY
-            topix_move = moves[factor_names.index("TOPIX変化率")]
-            usdjpy_move = moves[factor_names.index("USD/JPY変化率")]
-            cg_sens = sum(w[i] * df_sel.iloc[i].get("クロスΓ(FX×株)", 0.05)
-                          for i in range(len(df_sel)))
-            pnl_j = cg_sens * (topix_move / 100) * (usdjpy_move / 100) * aum / 1e6 * abs(move)
-
-        elif name == "短期金利変化(2Y JGB)":
-            sens = sum(
-                w[i] * df_sel.iloc[i].get("金利感応度(2Y)", df_sel.iloc[i]["金利感応度"] * 0.7) *
-                sector_rate_mult.get(df_sel.iloc[i]["セクター"], 0.0)
-                for i in range(len(df_sel)))
-            pnl_j = sens * (move / 100) * aum / 1e6
-
-        elif name == "長期金利変化(10Y JGB)":
-            sens = sum(
-                w[i] * df_sel.iloc[i].get("金利感応度(10Y)", df_sel.iloc[i]["金利感応度"]) *
-                sector_rate_mult.get(df_sel.iloc[i]["セクター"], 0.0)
-                for i in range(len(df_sel)))
-            pnl_j = sens * (move / 100) * aum / 1e6
-
-        elif name == "イールドカーブスティープ変化":
-            # イールドカーブスティープニングは銀行に有利、不動産・公益に不利
-            sens = sum(
-                w[i] * df_sel.iloc[i].get("YCスティープ感応度", 0.0)
-                for i in range(len(df_sel)))
-            pnl_j = sens * (move / 100) * aum / 1e6
-
-        elif name == "株式×金利クロスΓ":
-            # クロスガンマ項: PnL ≈ Σᵢ wᵢ×Γ_EQ_RATE × Δ_TOPIX × Δ_10Y
-            topix_move = moves[factor_names.index("TOPIX変化率")]
-            rate10y_move = moves[factor_names.index("長期金利変化(10Y JGB)")]
-            cg_sens = sum(w[i] * abs(df_sel.iloc[i].get("クロスΓ(株×金利)", 0.03))
-                          for i in range(len(df_sel)))
-            pnl_j = -cg_sens * abs(topix_move / 100) * abs(rate10y_move / 100) * aum / 1e6 * abs(move)
-
-        elif name == "クレジットスプレッド":
-            fin_w = sum(w[i] for i in range(len(df_sel))
-                        if df_sel.iloc[i]["セクター"] in ("金融", "不動産"))
-            credit_sens_port = sum(w[i] * abs(df_sel.iloc[i].get("クレジット感応度", -0.3))
-                                   for i in range(len(df_sel)))
-            pnl_j = -fin_w * (move / 100) * aum * 0.8 / 1e6 - credit_sens_port * (move / 100) * aum * 0.3 / 1e6
-
-        elif name == "ハイイールドスプレッド":
-            hy_sens_port = sum(
-                w[i] * abs(df_sel.iloc[i].get("HY感応度", -0.2)) *
-                abs(sector_hy_mult.get(df_sel.iloc[i]["セクター"], -0.2))
-                for i in range(len(df_sel)))
-            pnl_j = -hy_sens_port * (move / 100) * aum * 0.5 / 1e6
-
-        elif name == "原油価格変化率":
-            energy_w  = sum(w[i] for i in range(len(df_sel)) if df_sel.iloc[i]["セクター"] == "エネルギー")
-            consumer_w = sum(w[i] for i in range(len(df_sel)) if df_sel.iloc[i]["セクター"] == "消費財")
-            oil_sens_port = sum(w[i] * df_sel.iloc[i].get("原油感応度", 0.0) for i in range(len(df_sel)))
-            pnl_j = (energy_w * 0.6 - consumer_w * 0.3) * (move / 100) * aum / 1e6 \
-                    + oil_sens_port * (move / 100) * aum * 0.3 / 1e6
-
-        elif name == "金価格変化率":
-            gold_sens_port = sum(w[i] * df_sel.iloc[i].get("金感応度", 0.0) for i in range(len(df_sel)))
-            pnl_j = gold_sens_port * (move / 100) * aum / 1e6
-
+    elif cat == "SABR":
+        # SABR α: ボラ水準上昇 → ショートベガに損失
+        # SABR ρ: ρ低下（負値増大）→ 左歪みが強まる → Put側損失
+        # SABR ν: ν上昇 → ガンマコスト増大 → 損失
+        if "α" in nm:
+            pnl_j = iv_s * (mv/100) * aum * 0.30 / 1e6
+        elif "ρ" in nm:
+            pnl_j = -abs(gamma_s) * (mv/100) * aum * 0.20 / 1e6
+        elif "ν" in nm:
+            pnl_j = -abs(gamma_s) * (mv/100) * aum * 0.25 / 1e6
+        elif "β" in nm:
+            pnl_j = iv_s * 0.5 * (mv/100) * aum * 0.10 / 1e6
         else:
             pnl_j = 0.0
 
-        pnl_total += pnl_j
-        pnl_by_factor.append({"ファクター": name, "変化量": move,
-                               "単位": fac["unit"], "カテゴリ": fac.get("category",""),
-                               "PnL（百万円）": pnl_j})
+    elif cat == "VolSkew":
+        # ボラスキュー変化: Put側スキュー拡大 → プット保護コスト増
+        if "Put" in nm:
+            pnl_j = -abs(iv_s) * (mv/100) * aum * 0.20 / 1e6
+        elif "Call" in nm:
+            pnl_j = abs(iv_s) * (mv/100) * aum * 0.10 / 1e6
+        elif "カートシス" in nm:
+            pnl_j = -abs(gamma_s) * (mv/100) * aum * 0.15 / 1e6
+        else:
+            pnl_j = iv_s * (mv/100) * aum * 0.10 / 1e6
 
+    # ── C. FX系（Vanna-Volga含む）───────────────────────────────────────
+    elif cat == "FXΔ":
+        if "USD/JPY" in nm:
+            pnl_j = fx_usd_s * (mv/100) * aum / 1e6
+        elif "EUR/JPY" in nm or "EUR" in nm:
+            pnl_j = fx_eur_s * (mv/100) * aum / 1e6
+        elif "GBP" in nm:
+            pnl_j = fx_eur_s * 0.8 * (mv/100) * aum / 1e6
+        elif "AUD" in nm:
+            pnl_j = (oil_s * 0.3 + fx_usd_s * 0.4) * (mv/100) * aum / 1e6
+        elif "CNH" in nm or "新興国" in nm:
+            pnl_j = fx_usd_s * 0.3 * (mv/100) * aum / 1e6
+        else:
+            pnl_j = fx_usd_s * 0.5 * (mv/100) * aum / 1e6
+
+    elif cat == "FX VolSurf":
+        pnl_j = abs(iv_s) * (mv/100) * aum * 0.15 / 1e6
+
+    elif cat == "VannaVolga":
+        # VV: PnL ≈ x₁·Vanna·RR + x₂·Volga·BF
+        # RR（リスクリバーサル）が拡大 → 外国人の円プット需要増 → コスト増
+        # BF（バタフライ）が拡大 → 両テールのIV上昇 → ヘッジコスト増
+        if "RR" in nm:
+            # RR拡大 = 円安リスクプレミアム上昇 → 外貨資産保有者は円コストが増
+            pnl_j = -abs(fx_usd_s) * abs(cg_fxeq_s) * (mv/100) * aum * 0.15 / 1e6
+        elif "BF" in nm:
+            # BF拡大 = テールリスクプレミアム上昇
+            pnl_j = -abs(gamma_s) * (mv/100) * aum * 0.10 / 1e6
+        elif "Vanna" in nm:
+            # Vanna = ∂²V/∂S∂σ : FX移動とIV変化の交差感応度
+            pnl_j = -abs(fx_usd_s) * abs(iv_s) * (mv/100) * aum * 0.20 / 1e6
+        elif "Volga" in nm:
+            # Volga = ∂²V/∂σ² : IVに対する凸性
+            pnl_j = -abs(gamma_s) * (mv/100) * aum * 0.18 / 1e6
+        else:
+            pnl_j = 0.0
+
+    elif cat == "FX相関":
+        # FX通貨ペア間の相関変化: 分散効果に影響
+        pnl_j = -abs(fx_usd_s) * (mv/100) * aum * 0.10 / 1e6
+
+    # ── D. 金利・期間構造 ─────────────────────────────────────────────────
+    elif cat == "金利期間構造":
+        # テナー別感応度（10Yを基準に逓減）
+        tenor_weights = {
+            "1M": 0.05, "3M": 0.1, "6M": 0.2, "1Y": 0.4,
+            "2Y": 0.6,  "5Y": 0.8, "10Y": 1.0, "20Y": 1.3, "30Y": 1.5,
+        }
+        tw = 1.0
+        for t, w_t in tenor_weights.items():
+            if t + " " in nm or nm.endswith(t):
+                tw = w_t; break
+        pnl_j = rate10y_s * tw * (mv/100) * aum / 1e6
+
+    elif cat == "カーブ形状":
+        pnl_j = yc_s * (mv/100) * aum / 1e6
+
+    elif cat == "金利ボラ":
+        # スワップションIV上昇: 金利ヘッジコスト増
+        pnl_j = -abs(rate10y_s) * (mv/100) * aum * 0.15 / 1e6
+
+    elif cat == "金利スプレッド":
+        if "日米金利差" in nm:
+            pnl_j = (fx_usd_s + rate10y_s * 0.5) * (mv/100) * aum * 0.3 / 1e6
+        elif "実質金利" in nm:
+            pnl_j = rate10y_s * (mv/100) * aum * 0.8 / 1e6
+        elif "TONAR" in nm:
+            pnl_j = -(w_fin * 0.3 + abs(credit_s) * 0.2) * (mv/100) * aum / 1e6
+        else:
+            pnl_j = rate10y_s * 0.5 * (mv/100) * aum / 1e6
+
+    # ── E. クレジット系 ───────────────────────────────────────────────────
+    elif cat == "クレジット":
+        if "金融" in nm:
+            pnl_j = -w_fin * (mv/100) * aum * 0.8 / 1e6 \
+                    + credit_s * (mv/100) * aum * 0.3 / 1e6
+        elif "不動産" in nm:
+            pnl_j = -w_re * (mv/100) * aum * 0.7 / 1e6
+        elif "HY" in nm or "ハイイールド" in nm:
+            pnl_j = hy_s * (mv/100) * aum * 0.5 / 1e6
+        elif "デフォルト相関" in nm:
+            # 相関上昇 → CDO/CLOトランシェが非線形に損失
+            pnl_j = -abs(credit_s) * (mv/100) * aum * 0.30 / 1e6
+        elif "リカバリー" in nm:
+            pnl_j = abs(credit_s) * (mv/100) * aum * 0.15 / 1e6
+        elif "フォーリングエンジェル" in nm or "BBB" in nm:
+            pnl_j = -(abs(credit_s) + abs(hy_s)) * (mv/100) * aum * 0.25 / 1e6
+        elif "シニア-サブ" in nm:
+            pnl_j = -(w_fin + w_re) * (mv/100) * aum * 0.4 / 1e6
+        else:
+            pnl_j = credit_s * (mv/100) * aum * 0.4 / 1e6
+
+    # ── F. コモディティ系 ─────────────────────────────────────────────────
+    elif cat == "エネルギー":
+        if "期間構造" in nm:
+            pnl_j = oil_s * (mv/100) * aum * 0.2 / 1e6
+        else:
+            pnl_j = (w_ene * 0.6 - w_con * 0.3) * (mv/100) * aum / 1e6 \
+                    + oil_s * (mv/100) * aum * 0.3 / 1e6
+
+    elif cat == "貴金属":
+        if "金" in nm:
+            pnl_j = gold_s * (mv/100) * aum / 1e6
+        else:
+            pnl_j = gold_s * 0.7 * (mv/100) * aum / 1e6
+
+    elif cat == "産業金属":
+        # 銅・鉄鉱石 ↑ → 製造業コスト ↑ → 消費財・資本財に逆風
+        pnl_j = -w_con * 0.3 * (mv/100) * aum / 1e6 \
+                + oil_s * 0.3 * (mv/100) * aum / 1e6
+
+    elif cat == "農産物":
+        pnl_j = -w_con * 0.2 * (mv/100) * aum / 1e6
+
+    elif cat == "コモボラ":
+        if "OVX" in nm:
+            pnl_j = -oil_s * (mv/100) * aum * 0.2 / 1e6
+        else:
+            pnl_j = -abs(oil_s) * (mv/100) * aum * 0.1 / 1e6
+
+    # ── G. 流動性・マクロ系 ─────────────────────────────────────────────
+    elif cat == "流動性":
+        # Amihud流動性指数悪化 → スリッページ拡大 → 実損失増加
+        pnl_j = -topix_s * abs(mv/100) * aum * 0.25 / 1e6
+
+    elif cat == "マクロ":
+        if "GDP" in nm:
+            pnl_j = topix_s * (mv/100) * aum * 0.5 / 1e6
+        elif "CPI" in nm:
+            pnl_j = -(w_con + abs(rate10y_s * 0.3)) * (mv/100) * aum / 1e6
+        elif "PMI" in nm:
+            pnl_j = topix_s * 0.4 * (mv/100) * aum / 1e6
+        else:
+            pnl_j = 0.0
+
+    elif cat == "センチ":
+        if "Put/Call" in nm:
+            # P/C比上昇 → 市場が弱気 → 株安
+            pnl_j = -topix_s * abs(mv/100) * aum * 0.2 / 1e6
+        elif "システミック" in nm:
+            pnl_j = -(topix_s + abs(credit_s)) * (mv/100) * aum * 0.3 / 1e6
+
+    # ── クロスガンマ項（非線形交叉） ────────────────────────────────────
+    elif cat == "クロスΓ":
+        if "FX" in nm and "株" in nm:
+            pnl_j = cg_fxeq_s * (m_topix/100) * (m_usdjpy/100) * aum / 1e6 * abs(mv)
+        elif "株" in nm and "金利" in nm:
+            pnl_j = -cg_eqr_s * abs(m_topix/100) * abs(m_10y/100) * aum / 1e6 * abs(mv)
+        elif "流動性" in nm and "株" in nm:
+            pnl_j = -topix_s * abs(gamma_s) * (mv/100) * aum * 0.3 / 1e6
+        elif "原油" in nm and "FX" in nm:
+            pnl_j = -(oil_s * fx_usd_s) * (mv/100) * aum * 0.2 / 1e6
+        elif "クレジット" in nm:
+            pnl_j = -abs(credit_s) * abs(m_topix/100) * aum * 0.15 / 1e6 * abs(mv)
+        else:
+            pnl_j = -abs(gamma_s) * (mv/100) * aum * 0.1 / 1e6
+
+    return pnl_j
+
+def _is_dependent(j):
+    """他ファクター（TOPIX/USDJPY/10Y）の水準に依存する項か"""
+    cat = RST_FACTORS[j]["category"]
+    return cat in ("株式Γ", "クロスΓ")
+
+_DEP_J   = np.array([j for j in range(N_RST_FACTORS) if _is_dependent(j)], dtype=int)
+_INDEP_J = np.array([j for j in range(N_RST_FACTORS) if not _is_dependent(j)], dtype=int)
+
+class RSTEngine:
+    """PnLテーブルを事前計算し、シナリオ評価を numpy の参照だけで行う"""
+    def __init__(self, w, df_sel, aum):
+        c = _rst_context(w, df_sel, aum)
+        F, L = N_RST_FACTORS, N_RST_LEVELS
+        names = [f["name"] for f in RST_FACTORS]
+        cats  = [f["category"] for f in RST_FACTORS]
+        lv = _LEVELS_ARR
+        # 独立項: base[j, l]
+        self.base = np.zeros((F, L))
+        for j in _INDEP_J:
+            for l in range(L):
+                self.base[j, l] = _factor_pnl(names[j], cats[j], lv[j, l], 0.0, 0.0, 0.0, c)
+        # 依存項: dep[t, u, r, k, l]  (t,u,r = TOPIX/USDJPY/10Y の水準)
+        self.dep = np.zeros((L, L, L, len(_DEP_J), L))
+        for t in range(L):
+            for u in range(L):
+                for r in range(L):
+                    mt, mu, mr = lv[_M_TOPIX, t], lv[_M_USDJPY, u], lv[_M_10Y, r]
+                    for k, j in enumerate(_DEP_J):
+                        for l in range(L):
+                            self.dep[t, u, r, k, l] = _factor_pnl(
+                                names[j], cats[j], lv[j, l], mt, mu, mr, c)
+        self._ar_F = np.arange(F)
+        self._ar_D = np.arange(len(_DEP_J))
+
+    def total(self, idx):
+        """シナリオ1件の合計PnL"""
+        idx = np.asarray(idx, dtype=int)
+        d = self.dep[idx[_M_TOPIX], idx[_M_USDJPY], idx[_M_10Y]]
+        return float(self.base[self._ar_F, idx].sum() + d[self._ar_D, idx[_DEP_J]].sum())
+
+    def total_batch(self, idx_mat):
+        """シナリオ複数件 (B, F) の合計PnL をまとめて計算"""
+        idx_mat = np.asarray(idx_mat, dtype=int)
+        lin = self.base[self._ar_F, idx_mat].sum(axis=1)
+        d = self.dep[idx_mat[:, _M_TOPIX], idx_mat[:, _M_USDJPY], idx_mat[:, _M_10Y]]  # (B, D, L)
+        dep = np.take_along_axis(d, idx_mat[:, _DEP_J][:, :, None], axis=2)[:, :, 0].sum(axis=1)
+        return lin + dep
+
+def calc_rst_pnl(levels_idx, w, df_sel, aum):
+    """
+    108ファクターに対するポートフォリオPnL（百万円）とファクター別内訳。
+    （内訳表示用。探索ループでは RSTEngine.total を使う）
+    """
+    c = _rst_context(w, df_sel, aum)
+    moves = np.array([RST_FACTORS[j]["levels"][int(levels_idx[j])]
+                      for j in range(N_RST_FACTORS)], dtype=float)
+    m_topix, m_usdjpy, m_10y = moves[_M_TOPIX], moves[_M_USDJPY], moves[_M_10Y]
+    pnl_total = 0.0
+    pnl_by_factor = []
+    for j, fac in enumerate(RST_FACTORS):
+        pnl_j = _factor_pnl(fac["name"], fac["category"], moves[j], m_topix, m_usdjpy, m_10y, c)
+        pnl_total += pnl_j
+        pnl_by_factor.append({
+            "ファクター": fac["name"], "変化量": moves[j],
+            "単位":       fac["unit"],
+            "カテゴリ":   fac["category"],
+            "グループ":   fac.get("group", "?"),
+            "PnL（百万円）": pnl_j,
+        })
     return pnl_total, pnl_by_factor
 
 def classify_scenario(levels_idx, top_n=3):
@@ -1990,54 +1913,84 @@ def is_conventional_scenario(levels_idx):
     return len(set(nonzero)) == 1 or len(nonzero) <= 2
 
 # ── 古典ソルバー ─────────────────────────────────────────────────────────────
-def rst_greedy(w, df_sel, aum, n_iter=20):
-    """座標降下法：1ファクターずつ最悪水準に設定"""
-    best_idx = np.array([3]*N_RST_FACTORS, dtype=int)  # 初期: ゼロ水準
+def _time_up(t0, time_limit_sec):
+    """経過時間が上限に達したか（time_limit_sec=None/0 は無制限）"""
+    return bool(time_limit_sec) and (time.perf_counter() - t0) >= time_limit_sec
+
+def _get_engine(w, df_sel, aum, engine=None):
+    return engine if engine is not None else RSTEngine(w, df_sel, aum)
+
+def rst_greedy(w, df_sel, aum, n_iter=20, time_limit_sec=None, engine=None):
+    """座標降下法：1ファクターずつ最悪水準に設定
+    戻り値: best_idx, pnl, elapsed, n_eval, timed_out"""
     t0 = time.perf_counter()
+    eng = _get_engine(w, df_sel, aum, engine)
+    best_idx = np.array([3]*N_RST_FACTORS, dtype=int)  # 初期: ゼロ水準
+    n_eval, timed_out = 0, False
     for _ in range(n_iter):
         improved = False
         for j in range(N_RST_FACTORS):
-            best_l, best_pnl = best_idx[j], 1e18
-            for l in range(N_RST_LEVELS):
-                tmp = best_idx.copy(); tmp[j] = l
-                pnl, _ = calc_rst_pnl(tmp, w, df_sel, aum)
-                if pnl < best_pnl:
-                    best_pnl, best_l = pnl, l
-            if best_l != best_idx[j]:
+            if _time_up(t0, time_limit_sec):
+                timed_out = True
+                break
+            cand = np.tile(best_idx, (N_RST_LEVELS, 1))
+            cand[:, j] = np.arange(N_RST_LEVELS)
+            pnls = eng.total_batch(cand)
+            n_eval += N_RST_LEVELS
+            best_l = int(np.argmin(pnls))
+            if best_l != best_idx[j] and pnls[best_l] < pnls[best_idx[j]]:
                 best_idx[j] = best_l; improved = True
-        if not improved:
+        if timed_out or not improved:
             break
-    elapsed = time.perf_counter() - t0
-    pnl, pnl_by_fac = calc_rst_pnl(best_idx, w, df_sel, aum)
-    return best_idx, pnl, elapsed
+    return best_idx, eng.total(best_idx), time.perf_counter() - t0, n_eval, timed_out
 
-def rst_random(w, df_sel, aum, n_iter=1000, seed=42):
+def rst_random(w, df_sel, aum, n_iter=1000, seed=42, time_limit_sec=None,
+               engine=None, batch=2000):
+    """ランダム探索（バッチ評価。反復上限 or 時間上限の早い方で停止）
+    戻り値: best_idx, best_pnl, elapsed, history, n_eval, timed_out"""
+    t0 = time.perf_counter()
+    eng = _get_engine(w, df_sel, aum, engine)
     rng = np.random.default_rng(seed)
     best_idx = rng.integers(0, N_RST_LEVELS, N_RST_FACTORS)
-    best_pnl, _ = calc_rst_pnl(best_idx, w, df_sel, aum)
+    best_pnl = eng.total(best_idx)
     history = [best_pnl]
-    t0 = time.perf_counter()
-    for _ in range(n_iter):
-        idx = rng.integers(0, N_RST_LEVELS, N_RST_FACTORS)
-        pnl, _ = calc_rst_pnl(idx, w, df_sel, aum)
-        if pnl < best_pnl:
-            best_pnl, best_idx = pnl, idx.copy()
+    n_eval, timed_out = 1, False
+    while n_eval < n_iter + 1:
+        if _time_up(t0, time_limit_sec):
+            timed_out = True
+            break
+        b = min(batch, n_iter + 1 - n_eval)
+        cand = rng.integers(0, N_RST_LEVELS, (b, N_RST_FACTORS))
+        pnls = eng.total_batch(cand)
+        n_eval += b
+        k = int(np.argmin(pnls))
+        if pnls[k] < best_pnl:
+            best_pnl, best_idx = float(pnls[k]), cand[k].copy()
         history.append(best_pnl)
-    return best_idx, best_pnl, time.perf_counter() - t0, history
+    return best_idx, best_pnl, time.perf_counter() - t0, history, n_eval, timed_out
 
-def rst_sa(w, df_sel, aum, T_init=500.0, T_min=0.5, alpha=0.99, seed=0):
+def rst_sa(w, df_sel, aum, T_init=500.0, T_min=0.5, alpha=0.99, seed=0,
+           time_limit_sec=None, engine=None):
+    """模擬焼きなまし法（貪欲法の解を初期値に、時間上限内で探索）
+    戻り値: best_idx, best_pnl, elapsed, history, n_eval, timed_out"""
+    t0 = time.perf_counter()
+    eng = _get_engine(w, df_sel, aum, engine)
     rng = np.random.default_rng(seed)
-    cur_idx, _, _ = rst_greedy(w, df_sel, aum)
-    cur_pnl, _ = calc_rst_pnl(cur_idx, w, df_sel, aum)
+    cur_idx, cur_pnl, _, n_eval, _ = rst_greedy(w, df_sel, aum, engine=eng,
+                                                time_limit_sec=time_limit_sec)
     best_idx, best_pnl = cur_idx.copy(), cur_pnl
     T = T_init; history = []; cnt = 0
-    t0 = time.perf_counter()
+    timed_out = False
     while T > T_min:
         for _ in range(15):
+            if _time_up(t0, time_limit_sec):
+                timed_out = True
+                break
             new_idx = cur_idx.copy()
             j = rng.integers(0, N_RST_FACTORS)
             new_idx[j] = rng.integers(0, N_RST_LEVELS)
-            new_pnl, _ = calc_rst_pnl(new_idx, w, df_sel, aum)
+            new_pnl = eng.total(new_idx)
+            n_eval += 1
             delta = new_pnl - cur_pnl
             if delta < 0 or rng.random() < math.exp(-abs(delta)/(T+0.1)):
                 cur_idx, cur_pnl = new_idx, new_pnl
@@ -2045,8 +1998,10 @@ def rst_sa(w, df_sel, aum, T_init=500.0, T_min=0.5, alpha=0.99, seed=0):
                     best_pnl, best_idx = cur_pnl, cur_idx.copy()
             cnt += 1
         history.append((cnt, best_pnl))
+        if timed_out:
+            break
         T *= alpha
-    return best_idx, best_pnl, time.perf_counter() - t0, history
+    return best_idx, best_pnl, time.perf_counter() - t0, history, n_eval, timed_out
 
 # ══════════════════════════════════════════════════════════════════════════════
 # セッション状態
@@ -3035,20 +2990,31 @@ elif page == "🔍 リバースストレステスト":
     with c3:
         run_qa = st.checkbox("量子AE（要Amplifyトークン）",
                               value=bool(st.session_state.amplify_token))
+        solver_timeout_sec = st.number_input(
+            "ソルバー実行時間上限（秒／手法ごと）", min_value=1, max_value=600,
+            value=10, step=5,
+            help="各ソルバー（ランダム・貪欲法・SA・量子AE）の実行時間上限。"
+                 "上限に達した時点の最良解を結果として採用します。")
 
     run_rst = st.button("🚀 RST実行（全手法）", type="primary", use_container_width=True)
 
     if run_rst:
         prog = st.progress(0); status = st.empty()
         rst_results = {}
+        status.info("🧮 PnLテーブルを事前計算中...")
+        t_eng = time.perf_counter()
+        engine = RSTEngine(w, df, aum)
+        st.caption(f"PnLテーブル事前計算: {time.perf_counter() - t_eng:.2f}秒")
 
         # ① ランダム探索
         if run_classical:
             status.info("🎲 ランダム探索実行中...")
             prog.progress(5)
-            rs_idx, rs_pnl, rs_t, rs_hist = rst_random(w, df, aum, n_iter=n_sa_iter)
+            rs_idx, rs_pnl, rs_t, rs_hist, rs_eval, rs_to = rst_random(
+                w, df, aum, n_iter=n_sa_iter, time_limit_sec=solver_timeout_sec, engine=engine)
             rst_results["ランダム探索"] = {
                 "idx": rs_idx, "pnl": rs_pnl, "time": rs_t, "history": rs_hist,
+                "n_eval": rs_eval, "timed_out": rs_to,
                 "label": "ランダム探索", "color": "#ffffff", "icon": "🎲",
             }
             prog.progress(20)
@@ -3057,9 +3023,11 @@ elif page == "🔍 リバースストレステスト":
         if run_classical:
             status.info("📋 貪欲法（座標降下）実行中...")
             prog.progress(25)
-            g_idx, g_pnl, g_t = rst_greedy(w, df, aum)
+            g_idx, g_pnl, g_t, g_eval, g_to = rst_greedy(
+                w, df, aum, time_limit_sec=solver_timeout_sec, engine=engine)
             rst_results["貪欲法"] = {
                 "idx": g_idx, "pnl": g_pnl, "time": g_t, "history": None,
+                "n_eval": g_eval, "timed_out": g_to,
                 "label": "貪欲法（座標降下）", "color": "#22c55e", "icon": "📋",
             }
             prog.progress(40)
@@ -3068,9 +3036,11 @@ elif page == "🔍 リバースストレステスト":
         if run_classical:
             status.info("🌡️ 模擬焼きなまし法実行中...")
             prog.progress(45)
-            sa_idx, sa_pnl, sa_t, sa_hist = rst_sa(w, df, aum)
+            sa_idx, sa_pnl, sa_t, sa_hist, sa_eval, sa_to = rst_sa(
+                w, df, aum, time_limit_sec=solver_timeout_sec, engine=engine)
             rst_results["模擬焼きなまし法"] = {
                 "idx": sa_idx, "pnl": sa_pnl, "time": sa_t, "history": sa_hist,
+                "n_eval": sa_eval, "timed_out": sa_to,
                 "label": "模擬焼きなまし法 (SA)", "color": "#f97316", "icon": "🌡️",
             }
             prog.progress(65)
@@ -3086,10 +3056,9 @@ elif page == "🔍 リバースストレステスト":
                 # PnL係数を計算してQUBO構築
                 coef_lin = np.zeros((N_RST_FACTORS, N_RST_LEVELS))
                 for j in range(N_RST_FACTORS):
-                    for l in range(N_RST_LEVELS):
-                        tmp = [3]*N_RST_FACTORS; tmp[j] = l
-                        pnl_j, _ = calc_rst_pnl(tmp, w, df, aum)
-                        coef_lin[j, l] = pnl_j
+                    cand = np.full((N_RST_LEVELS, N_RST_FACTORS), 3, dtype=int)
+                    cand[:, j] = np.arange(N_RST_LEVELS)
+                    coef_lin[j] = engine.total_batch(cand)
 
                 max_abs = max(abs(coef_lin).max(), 1.0)
                 SCALE   = max_abs / 50.0
@@ -3103,7 +3072,7 @@ elif page == "🔍 リバースストレステスト":
 
                 client = FixstarsClient()
                 client.token = st.session_state.amplify_token
-                client.parameters.timeout = timedelta(seconds=5.0)
+                client.parameters.timeout = timedelta(seconds=float(solver_timeout_sec))
                 t0_qa = time.perf_counter()
                 result_qa = solve(Model(H), client)
                 qa_t = time.perf_counter() - t0_qa
@@ -3115,9 +3084,10 @@ elif page == "🔍 リバースストレステスト":
                         assigned = [l for l in range(N_RST_LEVELS) if qv[j][l] == 1]
                         qa_idx[j] = assigned[0] if len(assigned) == 1 else \
                             int(np.argmin(coef_lin[j]))
-                qa_pnl, _ = calc_rst_pnl(qa_idx, w, df, aum)
+                qa_pnl = engine.total(qa_idx)
                 rst_results["量子アニーリング"] = {
                     "idx": qa_idx, "pnl": qa_pnl, "time": qa_t, "history": None,
+                    "n_eval": None, "timed_out": None,
                     "label": "量子AE (Amplify)", "color": "#7c3aed", "icon": "⚛️",
                 }
             except Exception as e:
@@ -3190,6 +3160,9 @@ elif page == "🔍 リバースストレステスト":
             "手法":          f"{res['icon']} {res['label']}",
             "最悪損失（百万円）": int(res["pnl"]),
             "計算時間（秒）": round(res["time"], 3),
+            "評価回数":      f'{res["n_eval"]:,}' if res.get("n_eval") is not None else "—",
+            "停止理由":      ("⏱️ 時間上限" if res.get("timed_out")
+                              else "—" if res.get("timed_out") is None else "✅ 収束/反復完了"),
             "主要シナリオ":  sc_name,
             "シナリオ種別":  "⚠️ 想定外" if res.get("is_unexpected") else "✅ 想定内",
         })
